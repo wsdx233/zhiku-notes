@@ -1241,6 +1241,37 @@ input[type='checkbox'] {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.search-toggle.active {
+  background: #eee3f7;
+  color: #79549a;
+}
+.search-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.web-search-result {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid #e8dbee;
+  border-radius: 12px;
+  min-width: 0;
+}
+.web-search-result summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: #79549a;
+  overflow-wrap: anywhere;
+}
+.search-suggestions {
+  display: block;
+  border: 0;
+  width: 100%;
+  height: 160px;
+  margin-top: 10px;
+  background: #fff;
+}
 .send-button {
   height: 33px;
   width: 33px;
@@ -1560,6 +1591,23 @@ input[type='checkbox'] {
   position: absolute;
   right: 8px;
   top: 7px;
+}
+.search-setting {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #79549a;
+}
+.search-setting input {
+  width: 18px;
+  height: 18px;
+  accent-color: #9d7db5;
+}
+.search-help {
+  font-size: 14px;
+  line-height: 1.8;
+  color: #8d719e;
+  margin: 10px 0 18px;
 }
 .settings-notice {
   display: flex;

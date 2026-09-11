@@ -91,6 +91,8 @@ export function loadDatabase() {
     vaults: [vault],
     activeId: vault.id,
     settings: {
+      provider: 'compatible',
+      webSearch: false,
       endpoint: 'https://api.openai.com/v1/chat/completions',
       apiKey: '',
       model: 'gpt-4o-mini',

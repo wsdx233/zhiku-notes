@@ -19,6 +19,7 @@ import {
   listNoteLinks,
 } from './markdown'
 import { runAgent } from './agent'
+import { PROVIDERS, providerFor } from './llm-providers'
 import { graphMarkup, bindGraphNavigation } from './graph'
 import {
   prepareAttachment,
@@ -54,6 +55,7 @@ const state = {
   aiBusy: false,
   aiText: '',
   aiTools: [],
+  aiSearches: [],
   aiDraft: '',
   abort: null,
   attachments: [],
@@ -88,6 +90,11 @@ const selected = () =>
     (item) => item.id === state.selectedId && item.type === 'file',
   )
 const history = () => database.conversations?.[vault().id] || []
+const missingApiKey = () =>
+  !database.settings.apiKey &&
+  /^https?:\/\/(?:api\.openai\.com|api\.anthropic\.com|generativelanguage\.googleapis\.com)(?:[:/]|$)/i.test(
+    database.settings.endpoint,
+  )
 const dateLabel = (value) =>
   new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric' }).format(
     new Date(value),
@@ -174,7 +181,9 @@ function render() {
   if (state.modal) {
     requestAnimationFrame(() => {
       const input =
-        document.querySelector('.dialog input:not([type="password"]), .dialog select') ||
+        document.querySelector(
+          '.dialog input:not([type="password"]), .dialog select',
+        ) ||
         document.querySelector('.dialog button[type="submit"]') ||
         document.querySelector('.dialog button')
       input?.focus()
@@ -303,6 +312,7 @@ const toolLabels = {
   list_files: '浏览知识库',
   read_file: '阅读笔记',
   search_files: '查找知识',
+  web_search: '联网搜索',
   create_file: '创建笔记',
   update_file: '更新笔记',
   create_folder: '创建文件夹',
@@ -313,12 +323,27 @@ const toolLabels = {
 function aiMessagesMarkup() {
   const visible = history().filter(
     (message) =>
-      ['user', 'assistant'].includes(message.role) &&
-      (message.content || message.attachments?.length),
+      message.search ||
+      (['user', 'assistant'].includes(message.role) &&
+        (message.content || message.attachments?.length)),
   )
   if (!visible.length && !state.aiBusy)
-    return `<div class="ai-intro"><div class="ai-symbol">${icon('auto_awesome')}</div><h2>让灵感<br>多一种可能</h2><p>阅读、整理、连接<br>和你的知识一起思考</p><div class="ai-suggestions"><button data-prompt="请阅读并总结当前笔记，提炼最重要的观点">${icon('summarize')}<span>总结当前笔记</span>${icon('arrow_outward')}</button><button data-prompt="浏览我的知识库，发现可以连接的知识，并说明理由">${icon('hub')}<span>发现知识之间的联系</span>${icon('arrow_outward')}</button><button data-prompt="根据当前笔记，为我创建一篇延伸主题的新笔记，并使用双链连接来源">${icon('edit_square')}<span>把灵感写成新笔记</span>${icon('arrow_outward')}</button></div>${!database.settings.apiKey && database.settings.endpoint.includes('api.openai.com') ? '<button class="connect-model" data-action="settings">连接你的模型 ' + icon('arrow_forward') + '</button>' : ''}</div>`
-  return `${visible.map((message) => `<div class="chat-message ${message.role}">${message.role === 'assistant' ? '<div class="assistant-label">' + icon('auto_awesome') + '<span>知识助手</span></div>' : ''}<div class="markdown-body">${renderMarkdown(message.content || '', vault().items, selected()?.id)}</div>${renderSentAttachments(message.attachments || [])}</div>`).join('')}${state.aiBusy ? `<div class="chat-message assistant"><div class="assistant-label">${icon('auto_awesome', 'thinking')}<span>正在思考</span></div><div class="tool-activity">${state.aiTools.map((tool) => `<div>${icon(tool.status === 'running' ? 'progress_activity' : tool.status === 'error' ? 'error' : 'check_circle')}<span>${toolLabels[tool.name] || '执行操作'}</span></div>`).join('')}</div><div class="markdown-body live-answer">${renderMarkdown(state.aiText, vault().items, selected()?.id)}</div></div>` : ''}`
+    return `<div class="ai-intro"><div class="ai-symbol">${icon('auto_awesome')}</div><h2>让灵感<br>多一种可能</h2><p>阅读、整理、连接<br>和你的知识一起思考</p><div class="ai-suggestions"><button data-prompt="请阅读并总结当前笔记，提炼最重要的观点">${icon('summarize')}<span>总结当前笔记</span>${icon('arrow_outward')}</button><button data-prompt="浏览我的知识库，发现可以连接的知识，并说明理由">${icon('hub')}<span>发现知识之间的联系</span>${icon('arrow_outward')}</button><button data-prompt="根据当前笔记，为我创建一篇延伸主题的新笔记，并使用双链连接来源">${icon('edit_square')}<span>把灵感写成新笔记</span>${icon('arrow_outward')}</button></div>${missingApiKey() ? '<button class="connect-model" data-action="settings">连接你的模型 ' + icon('arrow_forward') + '</button>' : ''}</div>`
+  return `${visible.map((message) => (message.search ? renderSearchResult(message.search) : `<div class="chat-message ${message.role}">${message.role === 'assistant' ? '<div class="assistant-label">' + icon('auto_awesome') + '<span>知识助手</span></div>' : ''}<div class="markdown-body">${renderMarkdown(message.content || '', vault().items, selected()?.id)}</div>${renderSearchSuggestions(message.searchSuggestions)}${renderSentAttachments(message.attachments || [])}</div>`)).join('')}${state.aiBusy ? `<div class="chat-message assistant"><div class="assistant-label">${icon('auto_awesome', 'thinking')}<span>正在思考</span></div><div class="tool-activity">${state.aiTools.map((tool) => `<div>${icon(tool.status === 'running' ? 'progress_activity' : tool.status === 'error' ? 'error' : 'check_circle')}<span>${toolLabels[tool.name] || '执行操作'}${tool.result?.error ? '：' + escape(tool.result.error) : ''}</span></div>`).join('')}</div>${state.aiSearches.map(renderSearchResult).join('')}<div class="markdown-body live-answer">${renderMarkdown(state.aiText, vault().items, selected()?.id)}</div></div>` : ''}`
+}
+
+function renderSearchSuggestions(suggestions = []) {
+  // 保留 Google 要求展示的搜索建议；隔离脚本、表单、父页导航和页面样式。
+  return suggestions
+    .map(
+      (html) =>
+        `<iframe class="search-suggestions" title="Google 搜索建议" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" srcdoc="${escape("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; base-uri 'none'; form-action 'none'\"><base target=\"_blank\">" + html)}"></iframe>`,
+    )
+    .join('')
+}
+
+function renderSearchResult(search) {
+  return `<div class="web-search-result"><details><summary>${icon('travel_explore')}<span>${escape(search.query)}</span></summary><div class="markdown-body">${renderMarkdown(search.content, vault().items, selected()?.id)}</div></details>${renderSearchSuggestions(search.searchSuggestions)}</div>`
 }
 
 function renderSentAttachments(attachments) {
@@ -349,6 +374,7 @@ function renderAi() {
         <div class="pending-attachments">${renderPendingAttachments()}</div>
         <textarea id="ai-input" placeholder="问问你的知识库" aria-label="输入问题" rows="2">${escape(state.aiDraft)}</textarea>
         <div class="composer-bottom">${iconButton('tune', 'settings', '模型设置')}<span>${escape(database.settings.model || '选择模型')}</span>
+          <button type="button" class="icon-button search-toggle ${database.settings.webSearch ? 'active' : ''}" data-action="toggle-web-search" aria-label="联网搜索" aria-pressed="${database.settings.webSearch === true}" title="${database.settings.webSearch ? '联网搜索已开启' : '开启联网搜索（可能产生额外费用）'}" ${state.aiBusy ? 'disabled' : ''}>${icon('travel_explore')}</button>
           <button type="button" class="icon-button attachment-button" data-action="attach-files" aria-label="添加附件" title="添加图片或文本附件" ${state.readingAttachments ? 'disabled' : ''}>${icon(state.readingAttachments ? 'progress_activity' : 'attach_file')}</button>
           <button class="send-button ${state.aiBusy ? 'stop' : ''}" ${state.aiBusy ? 'type="button" data-action="stop-ai" aria-label="停止生成"' : 'type="submit" aria-label="发送问题"'} ${state.readingAttachments ? 'disabled' : ''}>${icon(state.aiBusy ? 'stop' : 'arrow_upward')}</button>
         </div>
@@ -382,7 +408,16 @@ function renderModal() {
   }[modal.type]
   let body
   if (modal.type === 'settings')
-    body = `<p class="dialog-description">连接自己的模型，让知识开始对话</p><label class="form-field"><span>模型接口</span><input name="endpoint" type="url" value="${escape(database.settings.endpoint)}" placeholder="https://api.openai.com/v1" required></label><label class="form-field"><span>API 密钥</span><div class="password-field"><input name="apiKey" type="password" value="${escape(database.settings.apiKey)}" autocomplete="off" placeholder="本地模型可留空">${iconButton('visibility', 'toggle-key', '显示或隐藏密钥')}</div></label><label class="form-field"><span>模型名称</span><input name="model" value="${escape(database.settings.model)}" required placeholder="gpt-4o-mini"></label><div class="settings-notice">${icon('shield')}<p>密钥仅保存在此浏览器。请求直接发送到模型接口，需要接口允许跨域访问。</p></div>`
+    body = `<p class="dialog-description">连接自己的模型，让知识开始对话</p><label class="form-field"><span>接口协议</span><select name="provider">${Object.entries(
+      PROVIDERS,
+    )
+      .map(
+        ([value, preset]) =>
+          `<option value="${value}" ${providerFor(database.settings) === value ? 'selected' : ''}>${preset.label}</option>`,
+      )
+      .join(
+        '',
+      )}</select></label><label class="form-field"><span>模型接口</span><input name="endpoint" type="url" value="${escape(database.settings.endpoint)}" placeholder="${PROVIDERS[providerFor(database.settings)].endpoint}" required></label><label class="form-field"><span>API 密钥</span><div class="password-field"><input name="apiKey" type="password" value="${escape(database.settings.apiKey)}" autocomplete="off" placeholder="本地或免鉴权网关可留空">${iconButton('visibility', 'toggle-key', '显示或隐藏密钥')}</div></label><label class="form-field"><span>模型名称</span><input name="model" value="${escape(database.settings.model)}" required placeholder="${PROVIDERS[providerFor(database.settings)].model}"></label><label class="search-setting"><input type="checkbox" name="webSearch" ${database.settings.webSearch ? 'checked' : ''} ${providerFor(database.settings) === 'compatible' ? 'disabled' : ''}><span>允许联网搜索</span></label><p class="search-help">需要支持搜索的模型与原生协议，兼容接口不提供统一搜索工具。开启后由模型按需搜索，可能产生额外费用；搜索查询会发送给服务商。请勿用于敏感笔记。切换协议会填入官方接口并清空密钥，中转地址请重新填写。</p><div class="settings-notice">${icon('shield')}<p>密钥仅保存在此浏览器。对话和相关笔记直接发送到所填接口，需要接口允许跨域访问。仅连接可信服务。</p></div>`
   else if (modal.type === 'connections') body = connectionContent()
   else if (modal.type === 'delete')
     body = `<p class="dialog-description">确定删除「${escape(modal.name)}」吗？${modal.vaultId ? '这会删除该知识库的全部笔记和对话。' : '文件夹中的内容也会一并删除。'}此操作无法撤销，请先导出备份。</p>`
@@ -469,7 +504,18 @@ async function handleAction(action, target) {
     state.menu = null
     render()
   } else if (action === 'settings') showModal('settings')
-  else if (action === 'close-modal') {
+  else if (action === 'toggle-web-search') {
+    if (state.aiBusy) return notify('请先停止当前生成')
+    if (providerFor(database.settings) === 'compatible') {
+      showModal('settings')
+      return notify('请先选择支持搜索的原生接口协议')
+    }
+    database.settings.webSearch = !database.settings.webSearch
+    save()
+    render()
+    if (database.settings.webSearch)
+      notify('联网搜索已开启，可能产生额外费用；请勿搜索敏感内容')
+  } else if (action === 'close-modal') {
     state.modal = null
     render()
   } else if (action === 'toggle-key') {
@@ -657,6 +703,19 @@ app.addEventListener('input', (event) => {
 
 app.addEventListener('change', (event) => {
   if (event.target.closest('.markdown-body')) return
+  if (
+    event.target.name === 'provider' &&
+    event.target.closest('#dialog-form')
+  ) {
+    const form = event.target.form
+    const preset = PROVIDERS[event.target.value]
+    form.elements.endpoint.value = preset.endpoint
+    form.elements.model.value = preset.model
+    form.elements.apiKey.value = ''
+    form.elements.webSearch.disabled = event.target.value === 'compatible'
+    if (form.elements.webSearch.disabled)
+      form.elements.webSearch.checked = false
+  }
   if (event.target.id === 'hide-isolated') {
     state.hideIsolated = event.target.checked
     render()
@@ -679,6 +738,8 @@ app.addEventListener('submit', async (event) => {
       if (!['http:', 'https:'].includes(url.protocol))
         throw new Error('请输入有效的 HTTP 或 HTTPS 接口')
       database.settings = {
+        provider: form.get('provider'),
+        webSearch: form.get('webSearch') === 'on',
         endpoint,
         apiKey: form.get('apiKey').trim(),
         model: form.get('model').trim(),
@@ -1066,8 +1127,7 @@ async function sendMessage(prompt) {
   if (
     !database.settings.model ||
     !database.settings.endpoint ||
-    (!database.settings.apiKey &&
-      database.settings.endpoint.includes('api.openai.com'))
+    missingApiKey()
   ) {
     state.aiDraft = text
     showModal('settings')
@@ -1097,6 +1157,7 @@ async function sendMessage(prompt) {
   database.conversations[targetVault.id] = messages
   state.aiText = ''
   state.aiTools = []
+  state.aiSearches = []
   state.aiDraft = ''
   state.attachments = []
   state.aiOpen = true
@@ -1122,6 +1183,7 @@ async function sendMessage(prompt) {
       if (atEnd) container.scrollTop = container.scrollHeight
     }
   }
+  let roundStart = 0
   try {
     const result = await runAgent({
       settings: database.settings,
@@ -1135,6 +1197,13 @@ async function sendMessage(prompt) {
       resolveMessages: resolveAttachmentMessages,
       onEvent: (event) => {
         if (event.type === 'text') state.aiText += event.content
+        if (event.type === 'round') {
+          if (state.aiText) state.aiText += '\n\n'
+          roundStart = state.aiText.length
+        }
+        if (event.type === 'answer')
+          state.aiText = state.aiText.slice(0, roundStart) + event.content
+        if (event.type === 'search') state.aiSearches.push(event.search)
         if (event.type === 'tool') {
           const last = state.aiTools.findLast(
             (tool) => tool.name === event.name && tool.status === 'running',
@@ -1153,6 +1222,11 @@ async function sendMessage(prompt) {
       : `请求未完成：${error.message}`
     database.conversations[targetVault.id] = [
       ...messages,
+      ...state.aiSearches.map((search) => ({
+        role: 'assistant',
+        content: search.content,
+        search,
+      })),
       {
         role: 'assistant',
         content: `${state.aiText ? state.aiText + '\n\n' : ''}${message}`,
@@ -1162,6 +1236,7 @@ async function sendMessage(prompt) {
     state.aiBusy = false
     state.abort = null
     state.aiText = ''
+    state.aiSearches = []
     save()
     render()
     const container = document.querySelector('#ai-messages')
