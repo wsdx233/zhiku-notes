@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>知库</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <input
+      id="import-input"
+      type="file"
+      accept=".zhiku,.json,application/json"
+      hidden
+    />
+    <input
+      id="attachment-input"
+      type="file"
+      accept="image/png,image/jpeg,image/webp,image/gif,text/*,.txt,.md,.csv,.json,.log,.yaml,.yml,.xml,.html,.css,.js,.ts,.py,.rs,.go,.java,.sql,.toml"
+      multiple
+      hidden
+    />
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
