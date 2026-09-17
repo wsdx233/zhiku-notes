@@ -608,17 +608,85 @@ const inlineMathExt = {
   },
 }
 
+const CALLOUT_CONFIGS = {
+  note: { title: '说明', icon: 'info', type: 'note' },
+  info: { title: '信息', icon: 'info', type: 'info' },
+  tip: { title: '提示', icon: 'lightbulb', type: 'tip' },
+  hint: { title: '建议', icon: 'lightbulb', type: 'tip' },
+  important: { title: '重要', icon: 'priority_high', type: 'important' },
+  warning: { title: '警告', icon: 'warning', type: 'warning' },
+  caution: { title: '小心', icon: 'warning', type: 'warning' },
+  danger: { title: '危险', icon: 'bolt', type: 'danger' },
+  error: { title: '错误', icon: 'error', type: 'danger' },
+  bug: { title: '缺陷', icon: 'bug_report', type: 'danger' },
+  example: { title: '示例', icon: 'auto_stories', type: 'example' },
+  quote: { title: '引用', icon: 'format_quote', type: 'quote' },
+  todo: { title: '待办', icon: 'checklist', type: 'todo' },
+  success: { title: '完成', icon: 'check_circle', type: 'success' },
+  done: { title: '完成', icon: 'check_circle', type: 'success' },
+  question: { title: '疑问', icon: 'help', type: 'question' },
+  help: { title: '帮助', icon: 'help', type: 'question' },
+  faq: { title: '常见问题', icon: 'help', type: 'question' },
+}
+
 const md = new Marked(markedFootnote())
 md.use({
   gfm: true,
   breaks: true,
   extensions: [mathBlockExt, inlineMathExt],
+  walkTokens(token) {
+    if (token.type === 'blockquote') {
+      const first = token.tokens?.[0]
+      if (first && first.type === 'paragraph') {
+        const text = first.text || ''
+        const match =
+          /^\[!([a-zA-Z0-9_-]+)\]([+-]?)(?:[ \t]+([^\n]*))?(?:\n([\s\S]*))?$/.exec(
+            text,
+          )
+        if (match) {
+          token.isCallout = true
+          token.calloutKey = match[1].toLowerCase()
+          token.calloutFold = match[2]
+          token.calloutTitle = match[3]?.trim()
+          const restText = match[4] || ''
+          if (restText.trim()) {
+            first.text = restText
+            first.tokens = this.Lexer.lexInline(restText)
+          } else {
+            token.tokens.shift()
+          }
+        }
+      }
+    }
+  },
   renderer: {
     heading(token) {
       const text = stripPlaceholders(tokensToText(token.tokens))
       const id = activeSlugger ? activeSlugger.slug(text) : ''
       const inner = this.parser.parseInline(token.tokens)
       return `<h${token.depth} id="${escapeHtml(id)}">${inner}</h${token.depth}>\n`
+    },
+    blockquote(token) {
+      if (token.isCallout) {
+        const cfg = CALLOUT_CONFIGS[token.calloutKey] || {
+          title: token.calloutKey.toUpperCase(),
+          icon: 'info',
+          type: 'note',
+        }
+        const title = token.calloutTitle || cfg.title
+        const body = token.tokens?.length ? this.parser.parse(token.tokens) : ''
+        const isCollapsible =
+          token.calloutFold === '-' || token.calloutFold === '+'
+        const defaultOpen = token.calloutFold !== '-'
+        const iconHtml = `<span class="material-symbols-rounded callout-icon" aria-hidden="true">${cfg.icon}</span>`
+        const titleHtml = `<span class="callout-title-text">${escapeHtml(title)}</span>`
+
+        if (isCollapsible) {
+          return `<details class="callout callout-${cfg.type}" ${defaultOpen ? 'open' : ''} data-callout="${escapeHtml(token.calloutKey)}"><summary class="callout-title">${iconHtml}${titleHtml}<span class="material-symbols-rounded callout-fold-icon" aria-hidden="true">expand_more</span></summary>${body ? `<div class="callout-content">${body}</div>` : ''}</details>\n`
+        }
+        return `<div class="callout callout-${cfg.type}" data-callout="${escapeHtml(token.calloutKey)}"><div class="callout-title">${iconHtml}${titleHtml}</div>${body ? `<div class="callout-content">${body}</div>` : ''}</div>\n`
+      }
+      return `<blockquote>${this.parser.parse(token.tokens)}</blockquote>\n`
     },
     code(token) {
       const lang = (token.lang || '').trim().split(/\s+/)[0]
@@ -637,7 +705,10 @@ md.use({
       const cls = lang
         ? ` class="hljs language-${escapeHtml(lang)}"`
         : ' class="hljs"'
-      return `<pre><code${cls}>${body}\n</code></pre>\n`
+      const langBadge = lang
+        ? `<span class="code-lang">${escapeHtml(lang)}</span>`
+        : '<span></span>'
+      return `<div class="code-block-wrapper"><div class="code-block-header">${langBadge}<button type="button" class="code-copy-button" data-code-copy="true" aria-label="复制代码"><span class="material-symbols-rounded" aria-hidden="true">content_copy</span><span>复制</span></button></div><pre><code${cls}>${body}\n</code></pre></div>\n`
     },
     // 用户原生 HTML：单独消毒，剥离 id/class/style/name、data-* 与交互控件
     html(token) {
@@ -651,13 +722,15 @@ md.use({
  * ------------------------------------------------------------------------- */
 
 const DOMPurify =
-  typeof DOMPurifyFactory.sanitize === 'function'
-    ? DOMPurifyFactory
-    : DOMPurifyFactory(window)
+  typeof window !== 'undefined'
+    ? typeof DOMPurifyFactory.sanitize === 'function'
+      ? DOMPurifyFactory
+      : DOMPurifyFactory(window)
+    : { sanitize: (s) => s, addHook: () => {} }
 
 let hookInstalled = false
 function ensureHook() {
-  if (hookInstalled) return
+  if (hookInstalled || typeof DOMPurify.addHook !== 'function') return
   hookInstalled = true
   DOMPurify.addHook('afterSanitizeAttributes', (node) => {
     if (node.tagName === 'A' && node.hasAttribute('href')) {
@@ -681,6 +754,9 @@ const SANITIZE_CONFIG = {
     'data-note-link',
     'data-note-heading',
     'data-embed-target',
+    'data-callout',
+    'data-code-copy',
+    'open',
   ],
 }
 

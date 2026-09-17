@@ -2,13 +2,22 @@ import {
   loadDatabase,
   saveDatabase,
   makeId,
-  createItem,
   renameItem,
   moveItem,
-  deleteItem,
   itemPath,
   exportVault,
   importVault,
+  isFileSystemAccessSupported,
+  isLocalDirectoryAccessSupported,
+  createLocalDirectoryVault,
+  syncLocalVaultFromDisk,
+  writeItemToDisk,
+  createWorkspaceItem,
+  deleteWorkspaceItem,
+  relocateItemOnDisk,
+  reconnectLocalVault,
+  keepLocalConflictCopy,
+  removeVaultHandle,
 } from './storage'
 import {
   renderMarkdown,
@@ -33,15 +42,34 @@ import 'katex/dist/katex.min.css'
 import '@fontsource-variable/noto-sans-sc'
 import '@fontsource-variable/material-symbols-rounded'
 import './styles.css'
+import { enhanceSelects, closeSelectMenu } from './select.js'
 
 const app = document.querySelector('#app')
 let database
 try {
-  database = loadDatabase()
+  database = await loadDatabase()
 } catch (error) {
   app.textContent = error.message
   throw error
 }
+
+function applyTheme(theme = database.settings.theme || 'system') {
+  const isDark =
+    theme === 'dark' ||
+    (theme === 'system' &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches)
+  document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light')
+  const meta = document.querySelector('meta[name="theme-color"]')
+  if (meta) meta.content = isDark ? '#151419' : '#ffffff'
+}
+
+applyTheme(database.settings.theme)
+window
+  .matchMedia('(prefers-color-scheme: dark)')
+  .addEventListener('change', () => {
+    if ((database.settings.theme || 'system') === 'system') applyTheme('system')
+  })
+
 const state = {
   selectedId: database.selections?.[database.activeId] || 'welcome',
   page: 'note',
@@ -63,10 +91,24 @@ const state = {
   graphQuery: '',
   hideIsolated: false,
   saved: true,
+  wikiSuggest: {
+    open: false,
+    query: '',
+    start: 0,
+    end: 0,
+    index: 0,
+    items: [],
+    x: 0,
+    y: 0,
+  },
 }
 let previewTimer
 let toastTimer
 let graphRefreshTimer
+const diskWriteTimers = new Map()
+let cacheWrites = 0
+let refreshRunning = false
+let dialogSubmitting = false
 const treeScrollPositions = new Map()
 
 const escape = (value = '') =>
@@ -108,21 +150,130 @@ function notify(message) {
   toastTimer = setTimeout(() => toast.classList.remove('show'), 3400)
 }
 
+function notifyLocalVaultCreated(entry) {
+  notify(`已直连本地文件夹「${entry.name}」`)
+}
+
 function save() {
   try {
     vault().updatedAt = new Date().toISOString()
     database.selections ||= {}
     database.selections[vault().id] = state.selectedId
+    cacheWrites++
+    state.saved = false
     saveDatabase(database)
-    state.saved = true
+      .then(() => {
+        cacheWrites--
+        if (!cacheWrites) state.saved = true
+      })
+      .catch((err) => {
+        cacheWrites--
+        state.saved = false
+        notify(err.message)
+      })
+    return true
   } catch (error) {
     state.saved = false
     notify(error.message)
+    return false
   }
-  const status = document.querySelector('.save-status')
-  if (status)
-    status.innerHTML = `${icon(state.saved ? 'cloud_done' : 'error')}<span>${state.saved ? '已保存到本地' : '保存失败'}</span>`
-  return state.saved
+}
+
+function localNoticeMarkup() {
+  const current = vault()
+  if (current.storageType !== 'local') return ''
+  const conflict =
+    current.items.find(
+      (item) => item.localConflict && item.id === state.selectedId,
+    ) || current.items.find((item) => item.localConflict)
+  if (conflict)
+    return `<div class="local-notice" role="status">${icon('difference')}<span>「${escape(conflict.name)}」存在本地冲突，工作区修改已保留</span><button type="button" class="text-button" data-action="keep-conflict-copy" data-id="${conflict.id}">另存副本</button></div>`
+  if (current.localError)
+    return `<div class="local-notice" role="status">${icon('folder_off')}<span>${escape(current.localError)}</span><button type="button" class="text-button" data-action="sync-local-vault">重新连接</button></div>`
+  return ''
+}
+
+function updateLocalNotice() {
+  const notice = document.querySelector('#local-notice')
+  if (notice) notice.innerHTML = localNoticeMarkup()
+}
+
+function queueLocalWrite(targetVault, file) {
+  if (targetVault.storageType !== 'local') return
+  file.localDirty = true
+  const key = `${targetVault.id}:${file.id}`
+  clearTimeout(diskWriteTimers.get(key))
+  // 捕获知识库和文件身份，切换笔记或知识库不会把内容写入其他目录。
+  diskWriteTimers.set(
+    key,
+    setTimeout(async () => {
+      diskWriteTimers.delete(key)
+      try {
+        await writeItemToDisk(targetVault, file)
+      } catch (error) {
+        targetVault.localError = error.message
+      }
+      save()
+      updateLocalNotice()
+    }, 400),
+  )
+}
+
+async function flushLocalWrites(targetVault) {
+  if (targetVault.storageType !== 'local') return
+  for (const file of targetVault.items.filter(
+    (item) => item.type === 'file' && item.localDirty && !item.localConflict,
+  )) {
+    const key = `${targetVault.id}:${file.id}`
+    clearTimeout(diskWriteTimers.get(key))
+    diskWriteTimers.delete(key)
+    await writeItemToDisk(targetVault, file)
+  }
+}
+
+async function refreshLocalWorkspace(manual = false) {
+  const targetVault = vault()
+  if (targetVault.storageType !== 'local' || refreshRunning) return
+  if (!manual && (document.hidden || state.modal || state.aiBusy)) return
+  refreshRunning = true
+  const previousError = targetVault.localError
+  let changed = false
+  let pending = false
+  try {
+    if (manual) await reconnectLocalVault(targetVault)
+    changed = await syncLocalVaultFromDisk(targetVault)
+    pending = targetVault.items.some(
+      (item) => item.localDirty && !item.localConflict,
+    )
+    await flushLocalWrites(targetVault)
+    if (changed && vault().id === targetVault.id && !state.modal) {
+      const editor = document.querySelector('#markdown-editor')
+      const focused = editor && document.activeElement === editor
+      const selection = editor
+        ? [editor.selectionStart, editor.selectionEnd, editor.scrollTop]
+        : null
+      render()
+      const next = document.querySelector('#markdown-editor')
+      if (focused && next) {
+        next.focus({ preventScroll: true })
+        next.setSelectionRange(selection[0], selection[1])
+        next.scrollTop = selection[2]
+      }
+    }
+    if (manual)
+      notify(
+        targetVault.items.some((item) => item.localConflict)
+          ? '本地冲突待处理，修改已保留'
+          : '本地文件已同步',
+      )
+  } catch (error) {
+    targetVault.localError = error.message
+    if (manual) notify(error.message)
+  } finally {
+    refreshRunning = false
+    updateLocalNotice()
+    if (changed || pending || previousError !== targetVault.localError) save()
+  }
 }
 
 function ensureSelection() {
@@ -145,6 +296,7 @@ function selectFile(id) {
 }
 
 function render() {
+  closeSelectMenu()
   clearTimeout(previewTimer)
   clearTimeout(graphRefreshTimer)
   ensureSelection()
@@ -160,6 +312,7 @@ function render() {
     ${state.sidebarOpen ? '<button class="sidebar-scrim" data-action="close-sidebar" aria-label="关闭导航"></button>' : ''}
     <main class="main-content">
       ${renderTopbar()}
+      <div id="local-notice">${localNoticeMarkup()}</div>
       <div class="work-area ${state.aiOpen ? 'with-ai' : ''}">
         <div class="workspace-content">${state.page === 'graph' ? renderGraph() : renderNote()}</div>
         ${state.aiOpen ? renderAi() : state.page === 'note' && selected() ? renderConnections() : ''}
@@ -168,6 +321,7 @@ function render() {
     ${state.menu ? renderMenu() : ''}
     ${state.modal ? renderModal() : ''}
   </div>`
+  enhanceSelects(app)
   const documentScroll = document.querySelector('.document-scroll')
   if (documentScroll) documentScroll.scrollTop = scroll
   const nextTree = document.querySelector('.file-tree')
@@ -182,7 +336,7 @@ function render() {
     requestAnimationFrame(() => {
       const input =
         document.querySelector(
-          '.dialog input:not([type="password"]), .dialog select',
+          '.dialog input:not([type="password"]):not([type="hidden"]):not(:disabled), .dialog .field-select-trigger',
         ) ||
         document.querySelector('.dialog button[type="submit"]') ||
         document.querySelector('.dialog button')
@@ -193,13 +347,15 @@ function render() {
 }
 
 function renderSidebar() {
+  const currentVault = vault()
+  const isLocal = currentVault.storageType === 'local'
   return `<aside class="sidebar">
     <button class="new-note" data-action="new-note">${icon('add')}<span>新建笔记</span></button>
     <label class="search-box">${icon('search')}<input id="note-search" placeholder="搜索笔记" value="${escape(state.search)}" aria-label="搜索笔记" autocomplete="off">${state.search ? '<button class="clear-search" data-action="clear-search" aria-label="清空搜索">' + icon('close') + '</button>' : ''}</label>
     <nav class="main-nav" aria-label="知识库导航"><button class="nav-row ${state.page === 'note' ? 'active' : ''}" data-action="notes">${icon('description')}<span>所有笔记</span><span class="note-count">${files().length}</span></button><button class="nav-row ${state.page === 'graph' ? 'active' : ''}" data-action="graph">${icon('hub')}<span>关系图谱</span></button></nav>
     <div class="tree-heading"><span>${state.search ? '搜索结果' : '我的笔记'}</span>${iconButton('create_new_folder', 'new-folder', '新建文件夹')}</div>
-    <div class="file-tree" data-drop-root="true" data-scroll-key="${escape(`${vault().id}:${state.search}`)}">${state.search ? renderSearchResults() : renderTree(null)}</div>
-    <div class="sidebar-bottom"><button class="vault-switch" data-action="vault-menu" aria-label="切换知识库" aria-expanded="${state.menu?.type === 'vault'}"><span class="vault-initial">${escape(vault().name[0])}</span><span>${escape(vault().name)}</span>${icon('unfold_more')}</button>${iconButton('settings', 'settings', '设置', 'sidebar-settings')}</div>
+    <div class="file-tree" data-drop-root="true" data-scroll-key="${escape(`${currentVault.id}:${state.search}`)}">${state.search ? renderSearchResults() : renderTree(null)}</div>
+    <div class="sidebar-bottom"><button class="vault-switch" data-action="vault-menu" aria-label="切换知识库" aria-expanded="${state.menu?.type === 'vault'}"><span class="vault-initial">${escape(currentVault.name[0])}</span><span>${escape(currentVault.name)}</span>${isLocal ? `<span class="vault-badge" title="本地文件夹直连">` + icon('folder_open') + '</span>' : ''}${icon('unfold_more')}</button>${iconButton('settings', 'settings', '设置', 'sidebar-settings')}</div>
   </aside>`
 }
 
@@ -241,8 +397,37 @@ function renderSearchResults() {
 
 function renderTopbar() {
   const file = selected()
-  const parent = vault().items.find((item) => item.id === file?.parentId)
-  return `<header class="topbar"><div class="breadcrumbs">${iconButton('menu', 'open-sidebar', '打开导航', 'mobile-only')}<span class="breadcrumb-parent">${escape(state.page === 'graph' ? vault().name : parent?.name || vault().name)}</span>${icon('chevron_right', 'breadcrumb-arrow')}<span class="breadcrumb-current">${escape(state.page === 'graph' ? '关系图谱' : extractTitle(file || { name: '所有笔记' }))}</span></div><div class="top-actions"><span class="save-status">${icon(state.saved ? 'cloud_done' : 'error')}<span>${state.saved ? '已保存到本地' : '保存失败'}</span></span><button class="ai-toggle ${state.aiOpen ? 'active' : ''}" data-action="toggle-ai">${icon('auto_awesome')}<span>知识助手</span></button></div></header>`
+  const currentVault = vault()
+  const isLocal = currentVault.storageType === 'local'
+  const parent = currentVault.items.find((item) => item.id === file?.parentId)
+  const currentTheme = database.settings.theme || 'system'
+  const themeIcon =
+    currentTheme === 'dark'
+      ? 'dark_mode'
+      : currentTheme === 'light'
+        ? 'light_mode'
+        : 'brightness_auto'
+  const themeLabel =
+    currentTheme === 'dark'
+      ? '深色模式'
+      : currentTheme === 'light'
+        ? '浅色模式'
+        : '跟随系统'
+
+  return `<header class="topbar">
+    <div class="breadcrumbs">
+      ${iconButton('menu', 'open-sidebar', '打开导航', 'mobile-only')}
+      <span class="breadcrumb-parent">${escape(state.page === 'graph' ? currentVault.name : parent?.name || currentVault.name)}</span>
+      ${isLocal ? `<span class="vault-badge" title="本地文件夹直连">` + icon('folder_open') + '</span>' : ''}
+      ${icon('chevron_right', 'breadcrumb-arrow')}
+      <span class="breadcrumb-current">${escape(state.page === 'graph' ? '关系图谱' : extractTitle(file || { name: '所有笔记' }))}</span>
+    </div>
+    <div class="top-actions">
+      ${isLocal ? `<button type="button" class="local-sync-button" data-action="sync-local-vault" title="同步本地变更">${icon('sync')}<span>同步</span></button>` : ''}
+      <button type="button" class="icon-button" data-action="cycle-theme" title="外观主题" aria-label="外观主题">${icon(themeIcon)}</button>
+      <button class="ai-toggle ${state.aiOpen ? 'active' : ''}" data-action="toggle-ai">${icon('auto_awesome')}<span>知识助手</span></button>
+    </div>
+  </header>`
 }
 
 function renderNote() {
@@ -255,7 +440,7 @@ function renderNote() {
     <div class="note-toolbar"><div class="view-switch" aria-label="编辑模式"><button class="${state.mode === 'read' ? 'active' : ''}" data-mode="read">${icon('chrome_reader_mode')}<span>阅读</span></button><button class="${state.mode === 'edit' ? 'active' : ''}" data-mode="edit">${icon('edit_note')}<span>编辑</span></button><button class="${state.mode === 'split' ? 'active' : ''} split-mode" data-mode="split" aria-label="分栏编辑" title="分栏编辑">${icon('vertical_split')}</button></div><div class="note-toolbar-right">${iconButton('link', 'copy-link', '复制双链')}${iconButton('more_horiz', 'note-menu', '笔记操作')}</div></div>
     ${state.mode !== 'read' ? renderFormatting() : ''}
     <div class="document-scroll ${state.mode === 'split' ? 'split-view' : ''}">
-      ${state.mode !== 'read' ? `<textarea class="markdown-editor" id="markdown-editor" aria-label="Markdown 编辑器" spellcheck="false" placeholder="从一个想法开始">${escape(file.content)}</textarea>` : ''}
+      ${state.mode !== 'read' ? `<div class="editor-wrap" style="position:relative;flex:1;display:flex;flex-direction:column;min-height:0;"><textarea class="markdown-editor" id="markdown-editor" aria-label="Markdown 编辑器" spellcheck="false" placeholder="从一个想法开始">${escape(file.content)}</textarea></div>` : ''}
       ${state.mode !== 'edit' ? `<div class="document-page"><article class="markdown-body" id="markdown-preview">${renderMarkdown(file.content, vault().items, file.id)}</article></div>` : ''}
     </div>
     <footer class="note-status"><span>${icon('notes')}<span id="word-count">${wordCount} 字</span></span><span>${icon('update')}<span>编辑于 ${dateLabel(file.updatedAt)}</span></span><button class="mobile-links" data-action="connections">${icon('link')}<span>反向链接</span></button></footer>
@@ -374,7 +559,7 @@ function renderAi() {
         <div class="pending-attachments">${renderPendingAttachments()}</div>
         <textarea id="ai-input" placeholder="问问你的知识库" aria-label="输入问题" rows="2">${escape(state.aiDraft)}</textarea>
         <div class="composer-bottom">${iconButton('tune', 'settings', '模型设置')}<span>${escape(database.settings.model || '选择模型')}</span>
-          <button type="button" class="icon-button search-toggle ${database.settings.webSearch ? 'active' : ''}" data-action="toggle-web-search" aria-label="联网搜索" aria-pressed="${database.settings.webSearch === true}" title="${database.settings.webSearch ? '联网搜索已开启' : '开启联网搜索（可能产生额外费用）'}" ${state.aiBusy ? 'disabled' : ''}>${icon('travel_explore')}</button>
+          <button type="button" class="icon-button search-toggle ${database.settings.webSearch ? 'active' : ''}" data-action="toggle-web-search" aria-label="联网搜索" aria-pressed="${database.settings.webSearch === true}" title="${database.settings.webSearch ? '联网搜索已开启' : '开启联网搜索 产生额外服务费用'}" ${state.aiBusy ? 'disabled' : ''}>${icon('travel_explore')}</button>
           <button type="button" class="icon-button attachment-button" data-action="attach-files" aria-label="添加附件" title="添加图片或文本附件" ${state.readingAttachments ? 'disabled' : ''}>${icon(state.readingAttachments ? 'progress_activity' : 'attach_file')}</button>
           <button class="send-button ${state.aiBusy ? 'stop' : ''}" ${state.aiBusy ? 'type="button" data-action="stop-ai" aria-label="停止生成"' : 'type="submit" aria-label="发送问题"'} ${state.readingAttachments ? 'disabled' : ''}>${icon(state.aiBusy ? 'stop' : 'arrow_upward')}</button>
         </div>
@@ -387,7 +572,7 @@ function renderMenu() {
   const close =
     '<button class="menu-scrim" aria-label="关闭菜单" data-action="close-menu"></button>'
   if (state.menu.type === 'vault')
-    return `${close}<div class="popup-menu vault-menu" role="menu"><h3>知识库</h3>${database.vaults.map((entry) => `<button data-vault="${entry.id}" class="menu-vault ${entry.id === vault().id ? 'active' : ''}"><span class="vault-initial">${escape(entry.name[0])}</span><span>${escape(entry.name)}</span>${entry.id === vault().id ? icon('check') : ''}</button>`).join('')}<div class="menu-divider"></div><button data-action="new-vault">${icon('add')}新建知识库</button><button data-action="rename-vault">${icon('drive_file_rename_outline')}重命名知识库</button><button data-action="export">${icon('download')}导出知识库</button><button data-action="import">${icon('upload')}导入知识库</button>${database.vaults.length > 1 ? '<button data-action="delete-vault" class="danger">' + icon('delete') + '删除知识库</button>' : ''}</div>`
+    return `${close}<div class="popup-menu vault-menu" role="menu"><h3>知识库</h3>${database.vaults.map((entry) => `<button data-vault="${entry.id}" class="menu-vault ${entry.id === vault().id ? 'active' : ''}"><span class="vault-initial">${escape(entry.name[0])}</span><span>${escape(entry.name)}</span>${entry.storageType === 'local' ? '<span class="vault-badge" style="margin-left:auto;margin-right:6px;">' + icon('folder_open') + '</span>' : ''}${entry.id === vault().id ? icon('check') : ''}</button>`).join('')}<div class="menu-divider"></div><button data-action="new-vault">${icon('add')}新建知识库</button>${isFileSystemAccessSupported() ? '<button data-action="open-local-vault">' + icon('folder_open') + '打开本地文件夹</button>' : ''}<button data-action="rename-vault">${icon('drive_file_rename_outline')}重命名知识库</button><button data-action="export">${icon('download')}导出知识库</button><button data-action="import">${icon('upload')}导入知识库</button>${database.vaults.length > 1 ? '<button data-action="delete-vault" class="danger">' + icon('delete') + '删除知识库</button>' : ''}</div>`
   const item = vault().items.find((entry) => entry.id === state.menu.id)
   if (!item) return ''
   return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu">${item.type === 'folder' ? '<button data-action="new-child-note">' + icon('note_add') + '新建笔记</button><button data-action="new-child-folder">' + icon('create_new_folder') + '新建文件夹</button>' : ''}<button data-action="rename-item">${icon('drive_file_rename_outline')}重命名</button><button data-action="move-item">${icon('drive_file_move')}移动到</button>${item.type === 'file' ? '<button data-action="download-note">' + icon('download') + '下载 Markdown</button>' : ''}<div class="menu-divider"></div><button class="danger" data-action="delete-item">${icon('delete')}删除</button></div>`
@@ -396,7 +581,7 @@ function renderMenu() {
 function renderModal() {
   const modal = state.modal
   const title = {
-    settings: '模型设置',
+    settings: '模型与外观设置',
     'new-note': '新建笔记',
     'new-folder': '新建文件夹',
     'new-vault': '新建知识库',
@@ -408,24 +593,45 @@ function renderModal() {
   }[modal.type]
   let body
   if (modal.type === 'settings')
-    body = `<p class="dialog-description">连接自己的模型，让知识开始对话</p><label class="form-field"><span>接口协议</span><select name="provider">${Object.entries(
-      PROVIDERS,
-    )
-      .map(
-        ([value, preset]) =>
-          `<option value="${value}" ${providerFor(database.settings) === value ? 'selected' : ''}>${preset.label}</option>`,
+    body = `<p class="dialog-description">配置模型接口与应用外观</p>
+      <label class="form-field"><span>外观主题</span><select name="theme">
+        <option value="system" ${(database.settings.theme || 'system') === 'system' ? 'selected' : ''}>跟随系统</option>
+        <option value="light" ${database.settings.theme === 'light' ? 'selected' : ''}>浅色模式</option>
+        <option value="dark" ${database.settings.theme === 'dark' ? 'selected' : ''}>深色模式</option>
+      </select></label>
+      <label class="form-field"><span>接口协议</span><select name="provider">${Object.entries(
+        PROVIDERS,
       )
-      .join(
-        '',
-      )}</select></label><label class="form-field"><span>模型接口</span><input name="endpoint" type="url" value="${escape(database.settings.endpoint)}" placeholder="${PROVIDERS[providerFor(database.settings)].endpoint}" required></label><label class="form-field"><span>API 密钥</span><div class="password-field"><input name="apiKey" type="password" value="${escape(database.settings.apiKey)}" autocomplete="off" placeholder="本地或免鉴权网关可留空">${iconButton('visibility', 'toggle-key', '显示或隐藏密钥')}</div></label><label class="form-field"><span>模型名称</span><input name="model" value="${escape(database.settings.model)}" required placeholder="${PROVIDERS[providerFor(database.settings)].model}"></label><label class="search-setting"><input type="checkbox" name="webSearch" ${database.settings.webSearch ? 'checked' : ''} ${providerFor(database.settings) === 'compatible' ? 'disabled' : ''}><span>允许联网搜索</span></label><p class="search-help">需要支持搜索的模型与原生协议，兼容接口不提供统一搜索工具。开启后由模型按需搜索，可能产生额外费用；搜索查询会发送给服务商。请勿用于敏感笔记。切换协议会填入官方接口并清空密钥，中转地址请重新填写。</p><div class="settings-notice">${icon('shield')}<p>密钥仅保存在此浏览器。对话和相关笔记直接发送到所填接口，需要接口允许跨域访问。仅连接可信服务。</p></div>`
-  else if (modal.type === 'connections') body = connectionContent()
+        .map(
+          ([value, preset]) =>
+            `<option value="${value}" ${providerFor(database.settings) === value ? 'selected' : ''}>${preset.label}</option>`,
+        )
+        .join(
+          '',
+        )}</select></label><label class="form-field"><span>模型接口</span><input name="endpoint" type="url" value="${escape(database.settings.endpoint)}" placeholder="${PROVIDERS[providerFor(database.settings)].endpoint}" required></label><label class="form-field"><span>API 密钥</span><div class="password-field"><input name="apiKey" type="password" value="${escape(database.settings.apiKey)}" autocomplete="off" placeholder="本地或免鉴权网关可留空">${iconButton('visibility', 'toggle-key', '显示或隐藏密钥')}</div></label><label class="form-field"><span>模型名称</span><input name="model" value="${escape(database.settings.model)}" required placeholder="${PROVIDERS[providerFor(database.settings)].model}"></label><label class="search-setting"><input type="checkbox" name="webSearch" ${database.settings.webSearch ? 'checked' : ''} ${providerFor(database.settings) === 'compatible' ? 'disabled' : ''}><span>允许联网搜索</span></label><p class="search-help">需要支持搜索的模型与原生协议，兼容接口不提供统一搜索工具。开启后由模型按需搜索，可能产生额外费用；搜索查询会发送给服务商。请勿用于敏感笔记。切换协议会填入官方接口并清空密钥，中转地址请重新填写。</p><div class="settings-notice">${icon('shield')}<p>密钥仅保存在此浏览器。对话和相关笔记直接发送到所填接口，需要接口允许跨域访问。仅连接可信服务。</p></div>`
+  else if (modal.type === 'new-vault') {
+    const isLocal = modal.storageMode === 'local'
+    const directAccess = isLocalDirectoryAccessSupported()
+    body = `<p class="dialog-description">选择笔记的存储位置</p>
+      <label class="form-field"><span>存储方式</span><select name="storageMode" id="new-vault-mode">
+        <option value="browser" data-icon="database" data-description="保存在当前浏览器，无需选择文件夹" ${isLocal ? '' : 'selected'}>浏览器存储</option>
+        <option value="local" data-icon="folder_open" data-description="直接读写本地文件，与其他编辑器互通" ${isLocal ? 'selected' : ''}>本地文件夹直连</option>
+      </select></label>
+      <div id="new-vault-name-wrap" ${isLocal ? 'hidden' : ''}>
+        <label class="form-field"><span>知识库名称</span><input name="name" value="新建知识库" placeholder="知识库名称" ${isLocal ? 'disabled' : 'required'} maxlength="150"></label>
+      </div>
+      <div id="new-vault-local-tip" class="settings-notice" ${isLocal ? '' : 'hidden'}>
+        ${icon(directAccess ? 'folder_open' : 'info')}
+        <p>${directAccess ? '选择文件夹并授权读写，修改自动写回本地。支持空文件夹，名称沿用所选文件夹。' : '当前环境无法直连。请使用 Chrome，通过 HTTPS 或本机 localhost 打开。不会转为目录导入。'}</p>
+      </div>`
+  } else if (modal.type === 'connections') body = connectionContent()
   else if (modal.type === 'delete')
-    body = `<p class="dialog-description">确定删除「${escape(modal.name)}」吗？${modal.vaultId ? '这会删除该知识库的全部笔记和对话。' : '文件夹中的内容也会一并删除。'}此操作无法撤销，请先导出备份。</p>`
+    body = `<p class="dialog-description">确定删除「${escape(modal.name)}」吗？${modal.vaultId ? (database.vaults.find((entry) => entry.id === modal.vaultId)?.storageType === 'local' ? '只移除知识库连接和对话，不会删除本地文件。' : '这会删除该知识库的全部笔记和对话。') : '文件夹中的内容也会一并删除。'}此操作无法撤销，请先导出备份。</p>`
   else if (modal.type === 'move')
     body = `<label class="form-field"><span>目标文件夹</span><select name="parentId">${folderOptions(modal.id)}</select></label>`
   else
     body = `<label class="form-field"><span>名称</span><input name="name" value="${escape(modal.value || '')}" placeholder="${modal.type.includes('folder') ? '文件夹名称' : modal.type.includes('vault') ? '知识库名称' : '笔记名称'}" required maxlength="150"></label>${['new-note', 'new-folder'].includes(modal.type) ? `<label class="form-field"><span>所在文件夹</span><select name="parentId">${folderOptions(null, modal.parentId)}</select></label>` : ''}`
-  return `<div class="modal-backdrop" data-action="close-modal"><section class="dialog ${modal.type === 'settings' ? 'settings-dialog' : ''}" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><form id="dialog-form"><header class="dialog-header"><h2 id="dialog-title">${title}</h2>${iconButton('close', 'close-modal', '关闭')}</header><div class="dialog-body">${body}<p class="form-error" role="alert"></p></div>${modal.type !== 'connections' ? `<footer class="dialog-footer"><button type="button" class="text-button" data-action="close-modal">取消</button><button class="filled-button ${modal.type === 'delete' ? 'danger-filled' : ''}" type="submit">${modal.type === 'delete' ? '确认删除' : modal.type === 'settings' ? '保存设置' : '确定'}</button></footer>` : ''}</form></section></div>`
+  return `<div class="modal-backdrop" data-action="close-modal"><section class="dialog ${modal.type === 'settings' ? 'settings-dialog' : ''}" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><form id="dialog-form"><header class="dialog-header"><h2 id="dialog-title">${title}</h2>${iconButton('close', 'close-modal', '关闭')}</header><div class="dialog-body">${body}<p class="form-error" role="alert"></p></div>${modal.type !== 'connections' ? `<footer class="dialog-footer"><button type="button" class="text-button" data-action="close-modal">取消</button><button class="filled-button ${modal.type === 'delete' ? 'danger-filled' : ''}" type="submit" ${modal.type === 'new-vault' && modal.storageMode === 'local' && !isLocalDirectoryAccessSupported() ? 'disabled' : ''}>${modal.type === 'delete' ? '确认删除' : modal.type === 'settings' ? '保存设置' : modal.type === 'new-vault' ? (modal.storageMode === 'local' ? '选择文件夹' : '创建知识库') : '确定'}</button></footer>` : ''}</form></section></div>`
 }
 
 function folderOptions(excludeId, selectedParent = null) {
@@ -515,7 +721,58 @@ async function handleAction(action, target) {
     render()
     if (database.settings.webSearch)
       notify('联网搜索已开启，可能产生额外费用；请勿搜索敏感内容')
+  } else if (action === 'cycle-theme') {
+    const current = database.settings.theme || 'system'
+    const next =
+      current === 'system' ? 'dark' : current === 'dark' ? 'light' : 'system'
+    database.settings.theme = next
+    applyTheme(next)
+    save()
+    render()
+    const label =
+      next === 'dark' ? '深色模式' : next === 'light' ? '浅色模式' : '跟随系统'
+    notify(`外观主题已切换为${label}`)
+  } else if (action === 'open-local-vault') {
+    if (state.aiBusy) return notify('请先停止当前对话')
+    if (!isLocalDirectoryAccessSupported())
+      return showModal('new-vault', { storageMode: 'local' })
+    state.menu = null
+    render()
+    try {
+      const entry = await createLocalDirectoryVault()
+      if (database.vaults.some((existing) => existing.name === entry.name))
+        entry.name += ' 副本'
+      database.vaults.push(entry)
+      database.activeId = entry.id
+      state.selectedId = entry.items[0]?.id || null
+      state.search = ''
+      state.aiDraft = ''
+      state.attachments = []
+      save()
+      render()
+      notifyLocalVaultCreated(entry)
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        notify(`打开本地文件夹失败: ${err.message}`)
+      }
+    }
+  } else if (action === 'sync-local-vault') {
+    await refreshLocalWorkspace(true)
+  } else if (action === 'keep-conflict-copy') {
+    try {
+      const targetVault = vault()
+      await reconnectLocalVault(targetVault)
+      const id = await keepLocalConflictCopy(targetVault, target.dataset.id)
+      if (vault().id === targetVault.id) state.selectedId = id
+      save()
+      render()
+      notify('工作区修改已另存副本，本地原文件未覆盖')
+    } catch (error) {
+      notify(error.message)
+      updateLocalNotice()
+    }
   } else if (action === 'close-modal') {
+    if (dialogSubmitting) return
     state.modal = null
     render()
   } else if (action === 'toggle-key') {
@@ -580,17 +837,52 @@ async function handleAction(action, target) {
 
 app.addEventListener('click', async (event) => {
   const target = event.target.closest(
-    'button, [data-note-link], [data-select], [data-folder]',
+    'button, [data-note-link], [data-select], [data-folder], [data-wiki-suggest-idx], [data-code-copy]',
   )
   if (event.target.classList.contains('modal-backdrop')) {
+    if (dialogSubmitting) return
     state.modal = null
     render()
     return
   }
+  const suggestItem = event.target.closest('[data-wiki-suggest-idx]')
+  if (suggestItem) {
+    event.preventDefault()
+    selectWikiSuggestItem(Number(suggestItem.dataset.wikiSuggestIdx))
+    return
+  }
+  const copyBtn = event.target.closest('[data-code-copy]')
+  if (copyBtn) {
+    event.preventDefault()
+    const wrapper = copyBtn.closest('.code-block-wrapper')
+    const code = wrapper?.querySelector('code')
+    if (code) {
+      try {
+        await navigator.clipboard.writeText(code.textContent)
+        copyBtn.classList.add('copied')
+        copyBtn.innerHTML = `${icon('check')}<span>已复制</span>`
+        setTimeout(() => {
+          copyBtn.classList.remove('copied')
+          copyBtn.innerHTML = `${icon('content_copy')}<span>复制</span>`
+        }, 1800)
+      } catch {
+        notify('复制失败，请手动选择复制')
+      }
+    }
+    return
+  }
+  if (
+    !event.target.closest('.wikilink-suggest-menu') &&
+    state.wikiSuggest?.open
+  ) {
+    state.wikiSuggest.open = false
+    document.querySelector('.wikilink-suggest-menu')?.remove()
+  }
   if (!target) return
   if (
     target.closest('.markdown-body') &&
-    !target.hasAttribute('data-note-link')
+    !target.hasAttribute('data-note-link') &&
+    !target.hasAttribute('data-code-copy')
   )
     return
   try {
@@ -627,6 +919,7 @@ app.addEventListener('click', async (event) => {
       state.collapsed.clear()
       save()
       render()
+      void refreshLocalWorkspace()
     } else if (target.dataset.noteLink !== undefined) {
       event.preventDefault()
       const raw = target.dataset.noteLink
@@ -669,7 +962,9 @@ app.addEventListener('input', (event) => {
     const file = selected()
     file.content = event.target.value
     file.updatedAt = new Date().toISOString()
+    queueLocalWrite(vault(), file)
     save()
+    updateWikiSuggest(event.target)
     const count = (file.content.match(/[\u3400-\u9fff]|[a-zA-Z0-9]+/g) || [])
       .length
     document.querySelector('#word-count').textContent = `${count} 字`
@@ -716,6 +1011,20 @@ app.addEventListener('change', (event) => {
     if (form.elements.webSearch.disabled)
       form.elements.webSearch.checked = false
   }
+  if (event.target.id === 'new-vault-mode') {
+    const isLocal = event.target.value === 'local'
+    state.modal.storageMode = event.target.value
+    const nameWrap = document.querySelector('#new-vault-name-wrap')
+    const tip = document.querySelector('#new-vault-local-tip')
+    nameWrap.hidden = isLocal
+    const nameInput = nameWrap.querySelector('input')
+    nameInput.disabled = isLocal
+    nameInput.required = !isLocal
+    tip.hidden = !isLocal
+    const submit = document.querySelector('#dialog-form button[type="submit"]')
+    submit.textContent = isLocal ? '选择文件夹' : '创建知识库'
+    submit.disabled = isLocal && !isLocalDirectoryAccessSupported()
+  }
   if (event.target.id === 'hide-isolated') {
     state.hideIsolated = event.target.checked
     render()
@@ -728,26 +1037,33 @@ app.addEventListener('submit', async (event) => {
     await sendMessage()
     return
   }
-  if (event.target.id !== 'dialog-form') return
+  if (event.target.id !== 'dialog-form' || dialogSubmitting) return
+  const formElement = event.target
   const form = new FormData(event.target)
   const modal = state.modal
+  dialogSubmitting = true
+  const submit = formElement.querySelector('button[type="submit"]')
+  if (submit) submit.disabled = true
   try {
     if (modal.type === 'settings') {
       const endpoint = form.get('endpoint').trim()
       const url = new URL(endpoint)
       if (!['http:', 'https:'].includes(url.protocol))
         throw new Error('请输入有效的 HTTP 或 HTTPS 接口')
+      const theme = form.get('theme') || 'system'
       database.settings = {
+        theme,
         provider: form.get('provider'),
         webSearch: form.get('webSearch') === 'on',
         endpoint,
         apiKey: form.get('apiKey').trim(),
         model: form.get('model').trim(),
       }
+      applyTheme(theme)
     } else if (modal.type === 'new-note' || modal.type === 'new-folder') {
       const type = modal.type === 'new-note' ? 'file' : 'folder'
       const name = form.get('name').trim()
-      const item = createItem(
+      const item = await createWorkspaceItem(
         vault(),
         type,
         name,
@@ -762,11 +1078,36 @@ app.addEventListener('submit', async (event) => {
       }
       if (item.parentId) state.collapsed.delete(item.parentId)
     } else if (modal.type === 'new-vault') {
+      const storageMode = form.get('storageMode') || 'browser'
+      if (storageMode === 'local') {
+        state.modal = null
+        render()
+        try {
+          const entry = await createLocalDirectoryVault()
+          if (database.vaults.some((existing) => existing.name === entry.name))
+            entry.name += ' 副本'
+          database.vaults.push(entry)
+          database.activeId = entry.id
+          state.selectedId = entry.items[0]?.id || null
+          state.search = ''
+          state.aiDraft = ''
+          state.attachments = []
+          save()
+          render()
+          notifyLocalVaultCreated(entry)
+        } catch (err) {
+          if (err.name !== 'AbortError') {
+            notify(`连接本地文件夹失败 ${err.message}`)
+          }
+        }
+        return
+      }
       const name = form.get('name').trim()
       if (!name) throw new Error('请输入知识库名称')
       const entry = {
         id: makeId(),
         name,
+        storageType: 'browser',
         items: [],
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -781,17 +1122,26 @@ app.addEventListener('submit', async (event) => {
       const name = form.get('name').trim()
       if (!name) throw new Error('请输入知识库名称')
       vault().name = name
-    } else if (modal.type === 'rename')
-      updateLocation(vault(), modal.id, { name: form.get('name') })
-    else if (modal.type === 'move')
-      updateLocation(vault(), modal.id, {
+    } else if (modal.type === 'rename') {
+      await updateLocation(vault(), modal.id, { name: form.get('name') })
+    } else if (modal.type === 'move')
+      await updateLocation(vault(), modal.id, {
         parentId: form.get('parentId') || null,
       })
     else if (modal.type === 'delete') {
       if (modal.vaultId) {
+        const removed = database.vaults.find(
+          (entry) => entry.id === modal.vaultId,
+        )
+        if (removed?.storageType === 'local') {
+          if (removed.items.some((item) => item.localConflict))
+            throw new Error('请先处理冲突或导出备份，再移除此连接')
+          await flushLocalWrites(removed)
+        }
         await deleteConversationAttachments(
           database.conversations[modal.vaultId] || [],
         )
+        await removeVaultHandle(modal.vaultId)
         database.vaults = database.vaults.filter(
           (entry) => entry.id !== modal.vaultId,
         )
@@ -800,7 +1150,11 @@ app.addEventListener('submit', async (event) => {
         state.selectedId = null
         state.search = ''
         state.attachments = []
-      } else deleteItem(vault(), modal.id)
+      } else {
+        const targetVault = vault()
+        await flushLocalWrites(targetVault)
+        await deleteWorkspaceItem(targetVault, modal.id)
+      }
     }
     const saved = save()
     if (!saved) {
@@ -812,9 +1166,16 @@ app.addEventListener('submit', async (event) => {
     render()
     if (modal.type === 'new-note')
       document.querySelector('#markdown-editor')?.focus()
-    if (modal.type === 'settings') notify('模型设置已保存')
+    if (modal.type === 'settings') notify('设置已保存')
   } catch (error) {
-    document.querySelector('.form-error').textContent = error.message
+    const field = document.querySelector('.form-error')
+    if (field) field.textContent = error.message
+    else notify(error.message)
+    updateLocalNotice()
+    save()
+  } finally {
+    dialogSubmitting = false
+    if (submit?.isConnected) submit.disabled = false
   }
 })
 
@@ -849,6 +1210,133 @@ function formatEditor(format) {
   editor.dispatchEvent(new Event('input', { bubbles: true }))
 }
 
+function getCaretPosition(textarea) {
+  const value = textarea.value.slice(0, textarea.selectionStart)
+  const lines = value.split('\n')
+  const lineNo = lines.length - 1
+  const lineHeight = 24
+  const charWidth = 8.5
+  const currentLine = lines[lines.length - 1]
+  const top = Math.min(
+    lineNo * lineHeight + 36,
+    Math.max(40, textarea.clientHeight - 180),
+  )
+  const left = Math.min(
+    20 + currentLine.length * charWidth,
+    Math.max(20, textarea.clientWidth - 300),
+  )
+  return {
+    x: Math.max(16, left),
+    y: Math.max(16, top),
+  }
+}
+
+function updateWikiSuggest(editor) {
+  const cursor = editor.selectionStart
+  const textBefore = editor.value.slice(0, cursor)
+  const match = /(?:^|[^\\])\[\[([^\]\n\r]*)$/.exec(textBefore)
+  if (!match) {
+    if (state.wikiSuggest.open) {
+      state.wikiSuggest.open = false
+      document.querySelector('.wikilink-suggest-menu')?.remove()
+    }
+    return
+  }
+
+  const query = match[1].toLowerCase().trim()
+  const matchStart = cursor - match[1].length - 2
+  const candidateFiles = files().filter((file) => file.id !== selected()?.id)
+
+  const matches = candidateFiles
+    .filter((file) => {
+      if (!query) return true
+      const title = extractTitle(file).toLowerCase()
+      const path = itemPath(vault(), file).toLowerCase()
+      return title.includes(query) || path.includes(query)
+    })
+    .sort((a, b) => {
+      const aTitle = extractTitle(a).toLowerCase()
+      const bTitle = extractTitle(b).toLowerCase()
+      if (query) {
+        if (aTitle.startsWith(query) && !bTitle.startsWith(query)) return -1
+        if (!aTitle.startsWith(query) && bTitle.startsWith(query)) return 1
+      }
+      return aTitle.localeCompare(bTitle, 'zh-CN')
+    })
+    .slice(0, 8)
+
+  if (!matches.length) {
+    state.wikiSuggest.open = false
+    document.querySelector('.wikilink-suggest-menu')?.remove()
+    return
+  }
+
+  const pos = getCaretPosition(editor)
+  state.wikiSuggest = {
+    open: true,
+    query,
+    start: matchStart,
+    end: cursor,
+    index: 0,
+    items: matches,
+    x: pos.x,
+    y: pos.y,
+  }
+
+  const container = editor.parentElement
+  if (!container) return
+  let menu = container.querySelector('.wikilink-suggest-menu')
+  if (!menu) {
+    menu = document.createElement('div')
+    menu.className = 'wikilink-suggest-menu'
+    container.appendChild(menu)
+  }
+  menu.style.left = `${pos.x}px`
+  menu.style.top = `${pos.y}px`
+  menu.innerHTML = matches
+    .map(
+      (file, idx) =>
+        `<div class="wikilink-suggest-item ${idx === 0 ? 'active' : ''}" data-wiki-suggest-idx="${idx}">
+          ${icon('article')}
+          <span class="suggest-title">${escape(extractTitle(file))}</span>
+          <span class="suggest-path">${escape(itemPath(vault(), file))}</span>
+        </div>`,
+    )
+    .join('')
+}
+
+function updateWikiSuggestActive() {
+  const items = document.querySelectorAll('.wikilink-suggest-item')
+  items.forEach((item, idx) => {
+    item.classList.toggle('active', idx === state.wikiSuggest.index)
+    if (idx === state.wikiSuggest.index) {
+      item.scrollIntoView({ block: 'nearest' })
+    }
+  })
+}
+
+function selectWikiSuggestItem(idx) {
+  const item = state.wikiSuggest.items[idx]
+  if (!item) return
+  const editor = document.querySelector('#markdown-editor')
+  if (!editor) return
+
+  const before = editor.value.slice(0, state.wikiSuggest.start)
+  const after = editor.value.slice(state.wikiSuggest.end)
+  const hasClosing = after.startsWith(']]')
+  const inserted = `[[${extractTitle(item)}]]`
+  const nextAfter = hasClosing ? after.slice(2) : after
+
+  editor.value = before + inserted + nextAfter
+  const newPos = before.length + inserted.length
+  editor.setSelectionRange(newPos, newPos)
+  editor.focus()
+
+  state.wikiSuggest.open = false
+  document.querySelector('.wikilink-suggest-menu')?.remove()
+  editor.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
 app.addEventListener('keydown', (event) => {
   if (
     event.target.id === 'ai-input' &&
@@ -859,15 +1347,55 @@ app.addEventListener('keydown', (event) => {
     event.preventDefault()
     sendMessage()
   }
-  if (event.target.id === 'markdown-editor' && event.key === 'Tab') {
-    event.preventDefault()
-    event.target.setRangeText(
-      '  ',
-      event.target.selectionStart,
-      event.target.selectionEnd,
-      'end',
-    )
-    event.target.dispatchEvent(new Event('input', { bubbles: true }))
+  if (event.target.id === 'markdown-editor') {
+    if (event.key === '[') {
+      const pos = event.target.selectionStart
+      if (pos > 0 && event.target.value[pos - 1] === '[') {
+        event.preventDefault()
+        event.target.setRangeText('[]]', pos, pos, 'end')
+        event.target.setSelectionRange(pos, pos)
+        event.target.dispatchEvent(new Event('input', { bubbles: true }))
+        return
+      }
+    }
+    if (state.wikiSuggest?.open && state.wikiSuggest.items.length) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        state.wikiSuggest.index =
+          (state.wikiSuggest.index + 1) % state.wikiSuggest.items.length
+        updateWikiSuggestActive()
+        return
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        state.wikiSuggest.index =
+          (state.wikiSuggest.index - 1 + state.wikiSuggest.items.length) %
+          state.wikiSuggest.items.length
+        updateWikiSuggestActive()
+        return
+      }
+      if (event.key === 'Enter' || event.key === 'Tab') {
+        event.preventDefault()
+        selectWikiSuggestItem(state.wikiSuggest.index)
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        state.wikiSuggest.open = false
+        document.querySelector('.wikilink-suggest-menu')?.remove()
+        return
+      }
+    }
+    if (event.key === 'Tab') {
+      event.preventDefault()
+      event.target.setRangeText(
+        '  ',
+        event.target.selectionStart,
+        event.target.selectionEnd,
+        'end',
+      )
+      event.target.dispatchEvent(new Event('input', { bubbles: true }))
+    }
   }
   if (
     event.target.classList.contains('graph-point') &&
@@ -880,6 +1408,7 @@ app.addEventListener('keydown', (event) => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
+    if (dialogSubmitting) return
     state.modal = null
     state.menu = null
     state.sidebarOpen = false
@@ -896,7 +1425,9 @@ document.addEventListener('keydown', (event) => {
       ...document.querySelectorAll(
         '.dialog button, .dialog input, .dialog select, .dialog textarea, .dialog a',
       ),
-    ].filter((node) => !node.disabled && node.getClientRects().length)
+    ].filter(
+      (node) => !node.disabled && !node.hidden && node.getClientRects().length,
+    )
     const first = focusable[0],
       last = focusable[focusable.length - 1]
     if (event.shiftKey && document.activeElement === first) {
@@ -928,7 +1459,7 @@ app.addEventListener('dragover', (event) => {
     event.dataTransfer.dropEffect = 'move'
   }
 })
-app.addEventListener('drop', (event) => {
+app.addEventListener('drop', async (event) => {
   const row = event.target.closest('[data-tree-id]')
   const parentId = row?.dataset.treeId || null
   if (
@@ -939,7 +1470,7 @@ app.addEventListener('drop', (event) => {
   if (!event.target.closest('.file-tree')) return
   event.preventDefault()
   try {
-    updateLocation(vault(), event.dataTransfer.getData('text/plain'), {
+    await updateLocation(vault(), event.dataTransfer.getData('text/plain'), {
       parentId,
     })
     if (parentId) state.collapsed.delete(parentId)
@@ -974,43 +1505,54 @@ document
     }
   })
 
-function updateLocation(targetVault, id, change) {
-  const references = targetVault.items
-    .filter((file) => file.type === 'file')
-    .map((file) => ({
-      file,
-      links: listNoteLinks(file.content)
-        .map((link) => ({
-          ...link,
-          file: resolveWikiLink(link.target, targetVault.items, file.id),
-        }))
-        .filter((link) => link.file),
-    }))
-  if (Object.hasOwn(change, 'name')) renameItem(targetVault, id, change.name)
-  else moveItem(targetVault, id, change.parentId)
-  for (const { file, links } of references) {
-    for (const link of links.reverse()) {
-      if (
-        resolveWikiLink(link.target, targetVault.items, file.id)?.id ===
-        link.file.id
-      )
-        continue
-      const anchorIndex = link.target.indexOf('#')
-      const anchor = anchorIndex < 0 ? '' : link.target.slice(anchorIndex)
-      let path = extractTitle(link.file)
-      if (
-        resolveWikiLink(path, targetVault.items, file.id)?.id !== link.file.id
-      )
-        path = itemPath(targetVault, link.file).replace(/\.md$/i, '')
-      if (/\.md(?:#|$)/i.test(link.target)) path = encodeURI(path + '.md')
-      file.content =
-        file.content.slice(0, link.start) +
-        path +
-        anchor +
-        file.content.slice(link.end)
-      file.updatedAt = new Date().toISOString()
+async function updateLocation(targetVault, id, change) {
+  await flushLocalWrites(targetVault)
+  const commit = () => {
+    const references = targetVault.items
+      .filter((file) => file.type === 'file')
+      .map((file) => ({
+        file,
+        links: listNoteLinks(file.content)
+          .map((link) => ({
+            ...link,
+            file: resolveWikiLink(link.target, targetVault.items, file.id),
+          }))
+          .filter((link) => link.file),
+      }))
+    if (Object.hasOwn(change, 'name')) renameItem(targetVault, id, change.name)
+    else moveItem(targetVault, id, change.parentId)
+    for (const { file, links } of references) {
+      for (const link of links.reverse()) {
+        if (
+          resolveWikiLink(link.target, targetVault.items, file.id)?.id ===
+          link.file.id
+        )
+          continue
+        const anchorIndex = link.target.indexOf('#')
+        const anchor = anchorIndex < 0 ? '' : link.target.slice(anchorIndex)
+        let path = extractTitle(link.file)
+        if (
+          resolveWikiLink(path, targetVault.items, file.id)?.id !== link.file.id
+        )
+          path = itemPath(targetVault, link.file).replace(/\.md$/i, '')
+        if (/\.md(?:#|$)/i.test(link.target)) path = encodeURI(path + '.md')
+        file.content =
+          file.content.slice(0, link.start) +
+          path +
+          anchor +
+          file.content.slice(link.end)
+        file.updatedAt = new Date().toISOString()
+        queueLocalWrite(targetVault, file)
+      }
     }
   }
+  if (targetVault.storageType === 'local') {
+    const draft = structuredClone(targetVault)
+    if (Object.hasOwn(change, 'name')) renameItem(draft, id, change.name)
+    else moveItem(draft, id, change.parentId)
+    await relocateItemOnDisk(targetVault, id, draft, commit)
+    await flushLocalWrites(targetVault)
+  } else commit()
 }
 
 async function executeTool(targetVault, name, args) {
@@ -1055,31 +1597,43 @@ async function executeTool(targetVault, name, args) {
   let result
   if (name === 'create_file') {
     if (typeof args.content !== 'string') throw new Error('笔记内容必须为文本')
-    result = summary(
-      createItem(
-        targetVault,
-        'file',
-        args.name,
-        args.parentId || null,
-        args.content,
-      ),
+    const item = await createWorkspaceItem(
+      targetVault,
+      'file',
+      args.name,
+      args.parentId || null,
+      args.content,
     )
-  } else if (name === 'create_folder')
-    result = summary(
-      createItem(targetVault, 'folder', args.name, args.parentId || null),
+    result = summary(item)
+  } else if (name === 'create_folder') {
+    const item = await createWorkspaceItem(
+      targetVault,
+      'folder',
+      args.name,
+      args.parentId || null,
     )
-  else if (name === 'update_file') {
+    result = summary(item)
+  } else if (name === 'update_file') {
     const file = find()
     if (file.type !== 'file' || typeof args.content !== 'string')
       throw new Error('目标或笔记内容不正确')
     file.content = args.content
     file.updatedAt = new Date().toISOString()
+    if (targetVault.storageType === 'local') {
+      file.localDirty = true
+      try {
+        await writeItemToDisk(targetVault, file)
+      } finally {
+        await saveDatabase(database)
+        updateLocalNotice()
+      }
+    }
     result = summary(file)
   } else if (name === 'rename_item') {
-    updateLocation(targetVault, args.id, { name: args.name })
+    await updateLocation(targetVault, args.id, { name: args.name })
     result = summary(find())
   } else if (name === 'move_item') {
-    updateLocation(targetVault, args.id, { parentId: args.parentId })
+    await updateLocation(targetVault, args.id, { parentId: args.parentId })
     result = summary(find())
   } else if (name === 'delete_item') {
     const item = find()
@@ -1087,11 +1641,12 @@ async function executeTool(targetVault, name, args) {
       !window.confirm(`知识助手请求删除「${item.name}」及其子内容，是否允许？`)
     )
       return { error: '用户拒绝删除' }
-    deleteItem(targetVault, args.id)
+    await flushLocalWrites(targetVault)
+    await deleteWorkspaceItem(targetVault, args.id)
     result = { deleted: args.id }
   } else throw new Error('不支持此工具')
   targetVault.updatedAt = new Date().toISOString()
-  saveDatabase(database)
+  await saveDatabase(database)
   return result
 }
 
@@ -1245,9 +1800,23 @@ async function sendMessage(prompt) {
 }
 
 window.addEventListener('beforeunload', (event) => {
-  if (!state.saved || state.aiBusy) {
+  if (
+    !state.saved ||
+    state.aiBusy ||
+    database.vaults.some(
+      (entry) =>
+        entry.storageType === 'local' &&
+        entry.items.some((item) => item.localDirty || item.localConflict),
+    )
+  ) {
     event.preventDefault()
     event.returnValue = ''
   }
 })
 render()
+void refreshLocalWorkspace()
+setInterval(() => void refreshLocalWorkspace(), 4000)
+window.addEventListener('focus', () => void refreshLocalWorkspace())
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) void refreshLocalWorkspace()
+})

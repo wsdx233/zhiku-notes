@@ -368,9 +368,26 @@ function citeText(text, citations, byteOffsets = false) {
   return text
 }
 
+function safeRandomId() {
+  const c =
+    typeof crypto !== 'undefined'
+      ? crypto
+      : typeof window !== 'undefined'
+        ? window.crypto
+        : null
+  if (c && typeof c.randomUUID === 'function') {
+    try {
+      return c.randomUUID()
+    } catch {
+      // fallback
+    }
+  }
+  return 'call_' + Math.random().toString(36).slice(2, 11) + Date.now().toString(36)
+}
+
 function toolCall(id, name, args) {
   return {
-    id: id || crypto.randomUUID(),
+    id: id || safeRandomId(),
     type: 'function',
     function: {
       name,

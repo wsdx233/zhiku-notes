@@ -1,4 +1,5 @@
 import { createStore, get, setMany, delMany } from 'idb-keyval'
+import { makeId } from './storage.js'
 
 const store = createStore('zhiku-attachments', 'files')
 const cache = new Map()
@@ -35,7 +36,7 @@ export async function prepareAttachment(file) {
   if (!image && payload.includes('\u0000'))
     throw new Error('此文件不是可读取的文本')
   return {
-    id: crypto.randomUUID(),
+    id: makeId(),
     name: file.name,
     type: image ? 'image' : 'text',
     payload,
