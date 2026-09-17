@@ -1,4 +1,21 @@
 import {
+  DOCUMENT_ACCEPT,
+  DOCUMENT_VERSION,
+  SOURCE_LIMITATIONS,
+  isSource,
+  isTextSource,
+  ensureSourceParsed,
+  isSourceParsing,
+  containsSource,
+  assertMutableItem,
+} from './documents.js'
+import {
+  knowledgeSummary,
+  readKnowledgeFile,
+  searchKnowledgeFiles,
+} from './knowledge-tools.js'
+import DOMPurify from 'dompurify'
+import {
   loadDatabase,
   saveDatabase,
   makeId,
@@ -7,7 +24,8 @@ import {
   itemPath,
   exportVault,
   importVault,
-  isFileSystemAccessSupported,
+  importSourceFile,
+  createDirectorySnapshot,
   isLocalDirectoryAccessSupported,
   createLocalDirectoryVault,
   syncLocalVaultFromDisk,
@@ -88,6 +106,7 @@ const state = {
   abort: null,
   attachments: [],
   readingAttachments: false,
+  importingSources: false,
   graphQuery: '',
   hideIsolated: false,
   saved: true,
@@ -151,7 +170,79 @@ function notify(message) {
 }
 
 function notifyLocalVaultCreated(entry) {
-  notify(`已直连本地文件夹「${entry.name}」`)
+  notify(
+    entry.directorySnapshot
+      ? '文件夹已导入为快照，不会写回本地'
+      : `已直连本地文件夹「${entry.name}」`,
+  )
+}
+
+const indexingVaults = new Map()
+async function indexVaultSources(targetVault) {
+  if (indexingVaults.has(targetVault.id))
+    return indexingVaults.get(targetVault.id)
+  const pending = targetVault.items.filter(
+    (item) =>
+      isSource(item) &&
+      (item.source.status === 'pending' ||
+        item.source.version !== DOCUMENT_VERSION),
+  )
+  if (!pending.length) return
+  const task = (async () => {
+    for (const file of pending) {
+      if (!database.vaults.includes(targetVault)) break
+      await ensureSourceParsed(file)
+      const current = targetVault.items.find((item) => item.id === file.id)
+      if (current?.source === file.source) current.content = file.content
+      try {
+        await saveDatabase(database)
+      } catch (error) {
+        notify(error.message)
+      }
+      if (vault().id === targetVault.id) {
+        if (
+          selected()?.id === file.id &&
+          state.page === 'note' &&
+          !state.modal
+        ) {
+          const scroll =
+            document.querySelector('.document-scroll')?.scrollTop || 0
+          const workspace = document.querySelector('.workspace-content')
+          if (workspace) workspace.innerHTML = renderNote()
+          const next = document.querySelector('.document-scroll')
+          if (next) next.scrollTop = scroll
+        }
+        if (state.search) {
+          const tree = document.querySelector('.file-tree')
+          if (tree) tree.innerHTML = renderSearchResults()
+        }
+      }
+    }
+  })()
+  indexingVaults.set(targetVault.id, task)
+  try {
+    await task
+  } finally {
+    indexingVaults.delete(targetVault.id)
+    if (database.vaults.includes(targetVault))
+      void indexVaultSources(targetVault)
+  }
+}
+
+function activateImportedVault(entry) {
+  if (database.vaults.some((existing) => existing.name === entry.name))
+    entry.name += ' 副本'
+  database.vaults.push(entry)
+  database.activeId = entry.id
+  state.selectedId =
+    entry.items.find((item) => item.type === 'file')?.id || null
+  state.search = ''
+  state.page = 'note'
+  state.aiDraft = ''
+  state.attachments = []
+  save()
+  render()
+  notifyLocalVaultCreated(entry)
 }
 
 function save() {
@@ -181,6 +272,8 @@ function save() {
 
 function localNoticeMarkup() {
   const current = vault()
+  if (current.directorySnapshot)
+    return `<div class="local-notice">${icon('folder_copy')}<span>文件夹快照，修改仅保存在浏览器，不会写回本地</span></div>`
   if (current.storageType !== 'local') return ''
   const conflict =
     current.items.find(
@@ -199,6 +292,7 @@ function updateLocalNotice() {
 }
 
 function queueLocalWrite(targetVault, file) {
+  if (isSource(file)) return
   if (targetVault.storageType !== 'local') return
   file.localDirty = true
   const key = `${targetVault.id}:${file.id}`
@@ -284,6 +378,7 @@ function selectFile(id) {
   if (!vault().items.some((item) => item.id === id && item.type === 'file'))
     return
   state.selectedId = id
+  if (isSource(selected())) state.mode = 'read'
   state.page = 'note'
   state.sidebarOpen = false
   state.menu = null
@@ -321,6 +416,7 @@ function render() {
     ${state.menu ? renderMenu() : ''}
     ${state.modal ? renderModal() : ''}
   </div>`
+  void indexVaultSources(vault())
   enhanceSelects(app)
   const documentScroll = document.querySelector('.document-scroll')
   if (documentScroll) documentScroll.scrollTop = scroll
@@ -351,9 +447,9 @@ function renderSidebar() {
   const isLocal = currentVault.storageType === 'local'
   return `<aside class="sidebar">
     <button class="new-note" data-action="new-note">${icon('add')}<span>新建笔记</span></button>
-    <label class="search-box">${icon('search')}<input id="note-search" placeholder="搜索笔记" value="${escape(state.search)}" aria-label="搜索笔记" autocomplete="off">${state.search ? '<button class="clear-search" data-action="clear-search" aria-label="清空搜索">' + icon('close') + '</button>' : ''}</label>
-    <nav class="main-nav" aria-label="知识库导航"><button class="nav-row ${state.page === 'note' ? 'active' : ''}" data-action="notes">${icon('description')}<span>所有笔记</span><span class="note-count">${files().length}</span></button><button class="nav-row ${state.page === 'graph' ? 'active' : ''}" data-action="graph">${icon('hub')}<span>关系图谱</span></button></nav>
-    <div class="tree-heading"><span>${state.search ? '搜索结果' : '我的笔记'}</span>${iconButton('create_new_folder', 'new-folder', '新建文件夹')}</div>
+    <label class="search-box">${icon('search')}<input id="note-search" placeholder="搜索笔记与资料" value="${escape(state.search)}" aria-label="搜索笔记与资料" autocomplete="off">${state.search ? '<button class="clear-search" data-action="clear-search" aria-label="清空搜索">' + icon('close') + '</button>' : ''}</label>
+    <nav class="main-nav" aria-label="知识库导航"><button class="nav-row ${state.page === 'note' ? 'active' : ''}" data-action="notes">${icon('description')}<span>笔记与资料</span><span class="note-count">${files().length}</span></button><button class="nav-row ${state.page === 'graph' ? 'active' : ''}" data-action="graph">${icon('hub')}<span>关系图谱</span></button></nav>
+    <div class="tree-heading"><span>${state.search ? '搜索结果' : '知识库内容'}</span>${iconButton('upload_file', 'import-sources', '添加资料')}${iconButton('create_new_folder', 'new-folder', '新建文件夹')}</div>
     <div class="file-tree" data-drop-root="true" data-scroll-key="${escape(`${currentVault.id}:${state.search}`)}">${state.search ? renderSearchResults() : renderTree(null)}</div>
     <div class="sidebar-bottom"><button class="vault-switch" data-action="vault-menu" aria-label="切换知识库" aria-expanded="${state.menu?.type === 'vault'}"><span class="vault-initial">${escape(currentVault.name[0])}</span><span>${escape(currentVault.name)}</span>${isLocal ? `<span class="vault-badge" title="本地文件夹直连">` + icon('folder_open') + '</span>' : ''}${icon('unfold_more')}</button>${iconButton('settings', 'settings', '设置', 'sidebar-settings')}</div>
   </aside>`
@@ -368,8 +464,8 @@ function renderTree(parentId, depth = 0) {
       .map((item) => {
         const isFolder = item.type === 'folder'
         const closed = state.collapsed.has(item.id)
-        return `<div class="tree-branch"><div class="tree-row ${isFolder ? 'folder-row' : 'note-row'} ${item.id === state.selectedId && state.page === 'note' ? 'selected' : ''}" style="--depth:${Math.min(depth, 8)}" data-tree-id="${item.id}" draggable="true">
-      <button class="tree-open" ${isFolder ? `data-folder="${item.id}" aria-expanded="${!closed}"` : `data-select="${item.id}"`} title="${escape(item.name)}">${isFolder ? icon(closed ? 'chevron_right' : 'expand_more', 'chevron') + icon('folder', 'folder-icon') : icon('article', 'file-icon')}<span>${escape(extractTitle(item))}</span></button>
+        return `<div class="tree-branch"><div class="tree-row ${isFolder ? 'folder-row' : 'note-row'} ${item.id === state.selectedId && state.page === 'note' ? 'selected' : ''}" style="--depth:${Math.min(depth, 8)}" data-tree-id="${item.id}" draggable="${!containsSource(vault(), item.id)}">
+      <button class="tree-open" ${isFolder ? `data-folder="${item.id}" aria-expanded="${!closed}"` : `data-select="${item.id}"`} title="${escape(item.name)}">${isFolder ? icon(closed ? 'chevron_right' : 'expand_more', 'chevron') + icon('folder', 'folder-icon') : icon(isSource(item) ? sourceIcon(item) : 'article', 'file-icon')}<span>${escape(extractTitle(item))}</span></button>
       <button class="tree-more" data-item-menu="${item.id}" aria-label="${escape(extractTitle(item))}的操作">${icon('more_horiz')}</button>
     </div>${isFolder && !closed ? renderTree(item.id, depth + 1) : ''}</div>`
       })
@@ -389,10 +485,10 @@ function renderSearchResults() {
     ? matches
         .map(
           (file) =>
-            `<button class="search-result ${file.id === state.selectedId ? 'selected' : ''}" data-select="${file.id}">${icon('article')}<span>${escape(extractTitle(file))}<span class="search-path">${escape(itemPath(vault(), file))}</span></span></button>`,
+            `<button class="search-result ${file.id === state.selectedId ? 'selected' : ''}" data-select="${file.id}">${icon(isSource(file) ? sourceIcon(file) : 'article')}<span>${escape(extractTitle(file))}<span class="search-path">${escape(itemPath(vault(), file))}</span></span></button>`,
         )
         .join('')
-    : `<div class="tree-empty">${icon('search_off')}<span>没有找到相关笔记</span></div>`
+    : `<div class="tree-empty">${icon('search_off')}<span>没有找到相关内容</span></div>`
 }
 
 function renderTopbar() {
@@ -434,6 +530,7 @@ function renderNote() {
   const file = selected()
   if (!file)
     return `<section class="empty-state"><div class="empty-symbol">${icon('edit_note')}</div><h1>给想法一个家</h1><p>新建一篇笔记，开始连接你的知识</p><button class="new-note" data-action="new-note">${icon('add')}<span>新建笔记</span></button></section>`
+  if (isSource(file)) return renderSource(file)
   const wordCount = (file.content.match(/[\u3400-\u9fff]|[a-zA-Z0-9]+/g) || [])
     .length
   return `<section class="note-workspace">
@@ -444,6 +541,42 @@ function renderNote() {
       ${state.mode !== 'edit' ? `<div class="document-page"><article class="markdown-body" id="markdown-preview">${renderMarkdown(file.content, vault().items, file.id)}</article></div>` : ''}
     </div>
     <footer class="note-status"><span>${icon('notes')}<span id="word-count">${wordCount} 字</span></span><span>${icon('update')}<span>编辑于 ${dateLabel(file.updatedAt)}</span></span><button class="mobile-links" data-action="connections">${icon('link')}<span>反向链接</span></button></footer>
+  </section>`
+}
+
+function sourceIcon(file) {
+  return (
+    {
+      pdf: 'picture_as_pdf',
+      pptx: 'slideshow',
+      docx: 'description',
+      xlsx: 'table_chart',
+      html: 'language',
+      htm: 'language',
+    }[file.source.format] || 'draft'
+  )
+}
+
+function renderSource(file) {
+  const source = file.source
+  const pending =
+    source.status === 'pending' ||
+    source.version !== DOCUMENT_VERSION ||
+    isSourceParsing(file)
+  const warnings = [SOURCE_LIMITATIONS, ...(source.warnings || [])]
+  const body = pending
+    ? `<div class="source-empty" role="status">${icon('hourglass_top')}<h2>正在解析资料</h2><p>文件保留在本机，解析完成后可供知识助手读取</p></div>`
+    : source.status === 'error'
+      ? `<div class="source-empty" role="alert">${icon('error')}<h2>暂时无法预览</h2><p>${escape(source.error)}</p><button class="text-button" data-action="retry-source">重新解析</button></div>`
+      : !file.content.trim()
+        ? `<div class="source-empty">${icon('find_in_page')}<h2>没有提取到文字</h2><p>扫描件需要 OCR，当前版本不包含文字识别</p></div>`
+        : isTextSource(source.format)
+          ? `<pre class="source-text">${escape(file.content)}</pre>`
+          : `<article class="markdown-body source-body">${DOMPurify.sanitize(renderMarkdown(file.content, vault().items, file.id), { FORBID_TAGS: ['img', 'picture', 'source', 'video', 'audio', 'iframe', 'object', 'embed', 'style', 'link', 'svg'], FORBID_ATTR: ['style', 'src', 'srcset', 'poster', 'background'] })}</article>`
+  return `<section class="note-workspace source-workspace">
+    <div class="note-toolbar"><div class="source-label">${icon('lock')}<span>只读资料</span><span class="source-format">${escape(source.format.toUpperCase())}</span></div><div class="note-toolbar-right">${iconButton('download', 'download-source', '下载原件')}${iconButton('refresh', 'retry-source', '重新解析')}${iconButton('link', 'copy-link', '复制双链')}</div></div>
+    <div class="document-scroll"><div class="document-page source-page"><header class="source-heading"><h1>${escape(file.name)}</h1><p>${escape(itemPath(vault(), file))}</p></header><div class="source-notice">${icon('info')}<div>${warnings.map((warning) => `<p>${escape(warning)}</p>`).join('')}</div></div>${body}</div></div>
+    <footer class="note-status"><span>${icon(sourceIcon(file))}<span>${Math.max(1, Math.ceil(source.size / 1024))} KB</span></span><span>${icon('manage_search')}<span>${pending ? '正在建立索引' : source.status === 'error' ? '解析失败' : source.chunks.length ? '可供知识助手读取' : '暂无可读取文字'}</span></span></footer>
   </section>`
 }
 
@@ -495,7 +628,7 @@ function renderGraph() {
 
 const toolLabels = {
   list_files: '浏览知识库',
-  read_file: '阅读笔记',
+  read_file: '阅读文件',
   search_files: '查找知识',
   web_search: '联网搜索',
   create_file: '创建笔记',
@@ -560,7 +693,7 @@ function renderAi() {
         <textarea id="ai-input" placeholder="问问你的知识库" aria-label="输入问题" rows="2">${escape(state.aiDraft)}</textarea>
         <div class="composer-bottom">${iconButton('tune', 'settings', '模型设置')}<span>${escape(database.settings.model || '选择模型')}</span>
           <button type="button" class="icon-button search-toggle ${database.settings.webSearch ? 'active' : ''}" data-action="toggle-web-search" aria-label="联网搜索" aria-pressed="${database.settings.webSearch === true}" title="${database.settings.webSearch ? '联网搜索已开启' : '开启联网搜索 产生额外服务费用'}" ${state.aiBusy ? 'disabled' : ''}>${icon('travel_explore')}</button>
-          <button type="button" class="icon-button attachment-button" data-action="attach-files" aria-label="添加附件" title="添加图片或文本附件" ${state.readingAttachments ? 'disabled' : ''}>${icon(state.readingAttachments ? 'progress_activity' : 'attach_file')}</button>
+          <button type="button" class="icon-button attachment-button" data-action="attach-files" aria-label="添加附件" title="添加图片、文档或文本附件" ${state.readingAttachments ? 'disabled' : ''}>${icon(state.readingAttachments ? 'progress_activity' : 'attach_file')}</button>
           <button class="send-button ${state.aiBusy ? 'stop' : ''}" ${state.aiBusy ? 'type="button" data-action="stop-ai" aria-label="停止生成"' : 'type="submit" aria-label="发送问题"'} ${state.readingAttachments ? 'disabled' : ''}>${icon(state.aiBusy ? 'stop' : 'arrow_upward')}</button>
         </div>
       </form>
@@ -572,9 +705,13 @@ function renderMenu() {
   const close =
     '<button class="menu-scrim" aria-label="关闭菜单" data-action="close-menu"></button>'
   if (state.menu.type === 'vault')
-    return `${close}<div class="popup-menu vault-menu" role="menu"><h3>知识库</h3>${database.vaults.map((entry) => `<button data-vault="${entry.id}" class="menu-vault ${entry.id === vault().id ? 'active' : ''}"><span class="vault-initial">${escape(entry.name[0])}</span><span>${escape(entry.name)}</span>${entry.storageType === 'local' ? '<span class="vault-badge" style="margin-left:auto;margin-right:6px;">' + icon('folder_open') + '</span>' : ''}${entry.id === vault().id ? icon('check') : ''}</button>`).join('')}<div class="menu-divider"></div><button data-action="new-vault">${icon('add')}新建知识库</button>${isFileSystemAccessSupported() ? '<button data-action="open-local-vault">' + icon('folder_open') + '打开本地文件夹</button>' : ''}<button data-action="rename-vault">${icon('drive_file_rename_outline')}重命名知识库</button><button data-action="export">${icon('download')}导出知识库</button><button data-action="import">${icon('upload')}导入知识库</button>${database.vaults.length > 1 ? '<button data-action="delete-vault" class="danger">' + icon('delete') + '删除知识库</button>' : ''}</div>`
+    return `${close}<div class="popup-menu vault-menu" role="menu"><h3>知识库</h3>${database.vaults.map((entry) => `<button data-vault="${entry.id}" class="menu-vault ${entry.id === vault().id ? 'active' : ''}"><span class="vault-initial">${escape(entry.name[0])}</span><span>${escape(entry.name)}</span>${entry.storageType === 'local' ? '<span class="vault-badge" style="margin-left:auto;margin-right:6px;">' + icon('folder_open') + '</span>' : ''}${entry.id === vault().id ? icon('check') : ''}</button>`).join('')}<div class="menu-divider"></div><button data-action="new-vault">${icon('add')}新建知识库</button>${'<button data-action="open-local-vault">' + icon('folder_open') + '打开本地文件夹</button><button data-action="import-directory">' + icon('folder_copy') + '导入文件夹快照</button>'}<button data-action="rename-vault">${icon('drive_file_rename_outline')}重命名知识库</button><button data-action="export">${icon('download')}导出知识库</button><button data-action="import">${icon('upload')}导入知识库</button>${database.vaults.length > 1 ? '<button data-action="delete-vault" class="danger">' + icon('delete') + '删除知识库</button>' : ''}</div>`
   const item = vault().items.find((entry) => entry.id === state.menu.id)
   if (!item) return ''
+  if (isSource(item))
+    return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu"><button data-action="download-source" data-id="${item.id}">${icon('download')}下载原件</button><button data-action="retry-source" data-id="${item.id}">${icon('refresh')}重新解析</button></div>`
+  if (containsSource(vault(), item.id))
+    return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu"><button data-action="new-child-note">${icon('note_add')}新建笔记</button><button data-action="new-child-folder">${icon('create_new_folder')}新建文件夹</button><p class="source-menu-hint">包含只读资料，不能移动或删除</p></div>`
   return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu">${item.type === 'folder' ? '<button data-action="new-child-note">' + icon('note_add') + '新建笔记</button><button data-action="new-child-folder">' + icon('create_new_folder') + '新建文件夹</button>' : ''}<button data-action="rename-item">${icon('drive_file_rename_outline')}重命名</button><button data-action="move-item">${icon('drive_file_move')}移动到</button>${item.type === 'file' ? '<button data-action="download-note">' + icon('download') + '下载 Markdown</button>' : ''}<div class="menu-divider"></div><button class="danger" data-action="delete-item">${icon('delete')}删除</button></div>`
 }
 
@@ -612,17 +749,17 @@ function renderModal() {
   else if (modal.type === 'new-vault') {
     const isLocal = modal.storageMode === 'local'
     const directAccess = isLocalDirectoryAccessSupported()
-    body = `<p class="dialog-description">选择笔记的存储位置</p>
+    body = `<p class="dialog-description">选择知识库的存储位置</p>
       <label class="form-field"><span>存储方式</span><select name="storageMode" id="new-vault-mode">
         <option value="browser" data-icon="database" data-description="保存在当前浏览器，无需选择文件夹" ${isLocal ? '' : 'selected'}>浏览器存储</option>
-        <option value="local" data-icon="folder_open" data-description="直接读写本地文件，与其他编辑器互通" ${isLocal ? 'selected' : ''}>本地文件夹直连</option>
+        <option value="local" data-icon="folder_open" data-description="支持时直连目录，否则导入文件夹快照" ${isLocal ? 'selected' : ''}>本地文件夹</option>
       </select></label>
       <div id="new-vault-name-wrap" ${isLocal ? 'hidden' : ''}>
         <label class="form-field"><span>知识库名称</span><input name="name" value="新建知识库" placeholder="知识库名称" ${isLocal ? 'disabled' : 'required'} maxlength="150"></label>
       </div>
       <div id="new-vault-local-tip" class="settings-notice" ${isLocal ? '' : 'hidden'}>
         ${icon(directAccess ? 'folder_open' : 'info')}
-        <p>${directAccess ? '选择文件夹并授权读写，修改自动写回本地。支持空文件夹，名称沿用所选文件夹。' : '当前环境无法直连。请使用 Chrome，通过 HTTPS 或本机 localhost 打开。不会转为目录导入。'}</p>
+        <p>${directAccess ? '选择文件夹并授权读写，笔记修改自动写回，资料保持只读。支持空文件夹，名称沿用所选文件夹。' : '当前环境使用标准目录选取，导入为浏览器快照，不会写回本地。不支持空目录。'}</p>
       </div>`
   } else if (modal.type === 'connections') body = connectionContent()
   else if (modal.type === 'delete')
@@ -631,7 +768,7 @@ function renderModal() {
     body = `<label class="form-field"><span>目标文件夹</span><select name="parentId">${folderOptions(modal.id)}</select></label>`
   else
     body = `<label class="form-field"><span>名称</span><input name="name" value="${escape(modal.value || '')}" placeholder="${modal.type.includes('folder') ? '文件夹名称' : modal.type.includes('vault') ? '知识库名称' : '笔记名称'}" required maxlength="150"></label>${['new-note', 'new-folder'].includes(modal.type) ? `<label class="form-field"><span>所在文件夹</span><select name="parentId">${folderOptions(null, modal.parentId)}</select></label>` : ''}`
-  return `<div class="modal-backdrop" data-action="close-modal"><section class="dialog ${modal.type === 'settings' ? 'settings-dialog' : ''}" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><form id="dialog-form"><header class="dialog-header"><h2 id="dialog-title">${title}</h2>${iconButton('close', 'close-modal', '关闭')}</header><div class="dialog-body">${body}<p class="form-error" role="alert"></p></div>${modal.type !== 'connections' ? `<footer class="dialog-footer"><button type="button" class="text-button" data-action="close-modal">取消</button><button class="filled-button ${modal.type === 'delete' ? 'danger-filled' : ''}" type="submit" ${modal.type === 'new-vault' && modal.storageMode === 'local' && !isLocalDirectoryAccessSupported() ? 'disabled' : ''}>${modal.type === 'delete' ? '确认删除' : modal.type === 'settings' ? '保存设置' : modal.type === 'new-vault' ? (modal.storageMode === 'local' ? '选择文件夹' : '创建知识库') : '确定'}</button></footer>` : ''}</form></section></div>`
+  return `<div class="modal-backdrop" data-action="close-modal"><section class="dialog ${modal.type === 'settings' ? 'settings-dialog' : ''}" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><form id="dialog-form"><header class="dialog-header"><h2 id="dialog-title">${title}</h2>${iconButton('close', 'close-modal', '关闭')}</header><div class="dialog-body">${body}<p class="form-error" role="alert"></p></div>${modal.type !== 'connections' ? `<footer class="dialog-footer"><button type="button" class="text-button" data-action="close-modal">取消</button><button class="filled-button ${modal.type === 'delete' ? 'danger-filled' : ''}" type="submit" >${modal.type === 'delete' ? '确认删除' : modal.type === 'settings' ? '保存设置' : modal.type === 'new-vault' ? (modal.storageMode === 'local' ? '选择文件夹' : '创建知识库') : '确定'}</button></footer>` : ''}</form></section></div>`
 }
 
 function folderOptions(excludeId, selectedParent = null) {
@@ -676,6 +813,36 @@ function download(blob, name) {
 
 async function handleAction(action, target) {
   const menuItem = vault().items.find((item) => item.id === state.menu?.id)
+  if (action === 'import-sources') {
+    if (state.importingSources) return notify('资料正在导入')
+    document.querySelector('#source-input').click()
+    return
+  }
+  if (action === 'download-source' || action === 'retry-source') {
+    const file =
+      vault().items.find((item) => item.id === target.dataset.id) ||
+      menuItem ||
+      selected()
+    if (!isSource(file)) return
+    state.menu = null
+    if (action === 'download-source') download(file.source.blob, file.name)
+    else {
+      if (isSourceParsing(file)) return notify('资料正在解析')
+      const task = ensureSourceParsed(file, { force: true })
+      render()
+      await task
+      await saveDatabase(database)
+    }
+    render()
+    return
+  }
+  if (action === 'import-directory') {
+    if (state.aiBusy) return notify('请先停止当前对话')
+    state.menu = null
+    document.querySelector('#directory-input').click()
+    render()
+    return
+  }
   if (action === 'close-menu') {
     state.menu = null
     render()
@@ -734,8 +901,12 @@ async function handleAction(action, target) {
     notify(`外观主题已切换为${label}`)
   } else if (action === 'open-local-vault') {
     if (state.aiBusy) return notify('请先停止当前对话')
-    if (!isLocalDirectoryAccessSupported())
-      return showModal('new-vault', { storageMode: 'local' })
+    if (!isLocalDirectoryAccessSupported()) {
+      state.menu = null
+      document.querySelector('#directory-input').click()
+      render()
+      return
+    }
     state.menu = null
     render()
     try {
@@ -904,6 +1075,7 @@ app.addEventListener('click', async (event) => {
     } else if (target.dataset.itemMenu)
       showItemMenu(target.dataset.itemMenu, target)
     else if (target.dataset.mode) {
+      if (isSource(selected())) return
       state.mode = target.dataset.mode
       render()
       document.querySelector('#markdown-editor')?.focus()
@@ -960,6 +1132,7 @@ app.addEventListener('input', (event) => {
     input.setSelectionRange(position, position)
   } else if (event.target.id === 'markdown-editor') {
     const file = selected()
+    if (!file || isSource(file)) return
     file.content = event.target.value
     file.updatedAt = new Date().toISOString()
     queueLocalWrite(vault(), file)
@@ -1023,7 +1196,7 @@ app.addEventListener('change', (event) => {
     tip.hidden = !isLocal
     const submit = document.querySelector('#dialog-form button[type="submit"]')
     submit.textContent = isLocal ? '选择文件夹' : '创建知识库'
-    submit.disabled = isLocal && !isLocalDirectoryAccessSupported()
+    submit.disabled = false
   }
   if (event.target.id === 'hide-isolated') {
     state.hideIsolated = event.target.checked
@@ -1080,6 +1253,12 @@ app.addEventListener('submit', async (event) => {
     } else if (modal.type === 'new-vault') {
       const storageMode = form.get('storageMode') || 'browser'
       if (storageMode === 'local') {
+        if (!isLocalDirectoryAccessSupported()) {
+          state.modal = null
+          document.querySelector('#directory-input').click()
+          render()
+          return
+        }
         state.modal = null
         render()
         try {
@@ -1443,6 +1622,8 @@ document.addEventListener('keydown', (event) => {
 app.addEventListener('dragstart', (event) => {
   const row = event.target.closest('[data-tree-id]')
   if (row) {
+    if (containsSource(vault(), row.dataset.treeId))
+      return event.preventDefault()
     event.dataTransfer.setData('text/plain', row.dataset.treeId)
     event.dataTransfer.effectAllowed = 'move'
   }
@@ -1481,6 +1662,68 @@ app.addEventListener('drop', async (event) => {
   }
 })
 
+document.querySelector('#attachment-input').accept += ',' + DOCUMENT_ACCEPT
+document.querySelector('#source-input').accept = DOCUMENT_ACCEPT
+document
+  .querySelector('#source-input')
+  .addEventListener('change', async (event) => {
+    const chosen = [...event.target.files]
+    event.target.value = ''
+    if (!chosen.length || state.importingSources) return
+    const targetVault = vault()
+    const parentId = selected()?.parentId || null
+    const failures = []
+    let count = 0,
+      firstId
+    state.importingSources = true
+    notify('正在导入资料，原件仅保存在本机')
+    try {
+      for (const file of chosen) {
+        if (!database.vaults.includes(targetVault)) break
+        try {
+          const item = await importSourceFile(targetVault, file, parentId)
+          firstId ||= item.id
+          count++
+        } catch (error) {
+          failures.push(`${file.name}：${error.message}`)
+        }
+      }
+      if (vault().id === targetVault.id && firstId) {
+        state.selectedId = firstId
+        state.mode = 'read'
+        state.page = 'note'
+        state.sidebarOpen = false
+        database.selections ||= {}
+        database.selections[targetVault.id] = firstId
+      }
+      await saveDatabase(database)
+      render()
+      notify(
+        failures.length
+          ? `已导入 ${count} 份，${failures[0]}`
+          : `已添加 ${count} 份只读资料`,
+      )
+    } catch (error) {
+      notify(error.message)
+    } finally {
+      state.importingSources = false
+    }
+  })
+
+document
+  .querySelector('#directory-input')
+  .addEventListener('change', async (event) => {
+    const files = [...event.target.files]
+    event.target.value = ''
+    if (!files.length) return
+    if (state.aiBusy) return notify('请先停止当前对话')
+    try {
+      activateImportedVault(await createDirectorySnapshot(files))
+    } catch (error) {
+      notify(`文件夹导入失败：${error.message}`)
+    }
+  })
+
 document.querySelector('#import-input').accept = '.zip,.zhiku,.json'
 document
   .querySelector('#import-input')
@@ -1506,10 +1749,11 @@ document
   })
 
 async function updateLocation(targetVault, id, change) {
+  assertMutableItem(targetVault, id)
   await flushLocalWrites(targetVault)
   const commit = () => {
     const references = targetVault.items
-      .filter((file) => file.type === 'file')
+      .filter((file) => file.type === 'file' && !isSource(file))
       .map((file) => ({
         file,
         links: listNoteLinks(file.content)
@@ -1561,39 +1805,24 @@ async function executeTool(targetVault, name, args) {
     if (!item) throw new Error('文件不存在')
     return item
   }
-  const summary = (item) => ({
-    id: item.id,
-    type: item.type,
-    name: item.name,
-    path: itemPath(targetVault, item),
-    parentId: item.parentId,
-  })
+  const summary = (item) => knowledgeSummary(targetVault, item)
   if (name === 'list_files') return targetVault.items.map(summary)
   if (name === 'read_file') {
-    const file = find()
-    if (file.type !== 'file') throw new Error('目标不是笔记')
-    return { ...summary(file), content: file.content }
+    const result = await readKnowledgeFile(targetVault, args)
+    await saveDatabase(database)
+    return result
   }
   if (name === 'search_files') {
-    if (typeof args.query !== 'string') throw new Error('查询内容必须为文本')
-    const query = args.query.toLowerCase()
-    return targetVault.items
-      .filter(
-        (item) =>
-          item.type === 'file' &&
-          `${item.name}\n${item.content}`.toLowerCase().includes(query),
-      )
-      .map((file) => {
-        const at = file.content.toLowerCase().indexOf(query)
-        return {
-          ...summary(file),
-          excerpt: file.content.slice(
-            Math.max(0, at - 100),
-            Math.max(0, at - 100) + 700,
-          ),
-        }
-      })
+    const result = await searchKnowledgeFiles(
+      targetVault,
+      args.query,
+      state.abort?.signal,
+    )
+    await saveDatabase(database)
+    return result
   }
+  if (['update_file', 'rename_item', 'move_item', 'delete_item'].includes(name))
+    assertMutableItem(targetVault, args.id)
   let result
   if (name === 'create_file') {
     if (typeof args.content !== 'string') throw new Error('笔记内容必须为文本')

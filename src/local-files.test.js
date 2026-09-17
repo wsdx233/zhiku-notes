@@ -416,3 +416,83 @@ test('外部将目录替换为同名文件时保留子笔记草稿且不产生�
   const { validateVault } = await import('./storage.js')
   validateVault({ ...vault, name: '测试' })
 })
+
+test('扫描资料保留二进制原件，不作为文本笔记写回', async () => {
+  const root = new MemoryDirectory()
+  const bytes = new Uint8Array([80, 75, 3, 4, 0, 255, 1, 128])
+  await put(root, '资料/报告.docx', bytes)
+  const items = await readDirectory(root, makeId)
+  const source = items.find((item) => item.kind === 'source')
+  assert.equal(source.name, '报告.docx')
+  assert.equal(source.diskContent, undefined)
+  assert.equal(source.source.status, 'pending')
+  assert.deepEqual(
+    new Uint8Array(await source.source.blob.arrayBuffer()),
+    bytes,
+  )
+  await assert.rejects(writeLocalFile(root, { items }, source), /只读/)
+  await assert.rejects(deleteLocalEntry(root, { items }, source), /只读/)
+  const folder = items.find((item) => item.type === 'folder')
+  await assert.rejects(
+    moveLocalEntry(root, { items }, folder, '新目录'),
+    /只读/,
+  )
+  await assert.rejects(deleteLocalEntry(root, { items }, folder), /只读/)
+})
+
+test('资料同步复用解析缓存，外部内容变更后重新解析而不保留旧草稿', async () => {
+  const root = new MemoryDirectory()
+  const disk = await put(root, '网页.html', '<p>初稿</p>')
+  const book = { items: await readDirectory(root, makeId) }
+  const item = book.items[0]
+  item.source.status = 'ready'
+  item.source.text = '初稿'
+  item.source.chunks = [{ text: '初稿', pages: [], path: [] }]
+  item.content = '初稿'
+  assert.equal(
+    reconcileDirectory(book, await readDirectory(root, makeId)),
+    false,
+  )
+  assert.equal(book.items[0].source, item.source)
+  disk.content = '<p>二稿</p>'
+  // 即使大小和修改时间相同，也不能复用旧内容的缓存。
+  assert.equal(
+    reconcileDirectory(book, await readDirectory(root, makeId)),
+    true,
+  )
+  assert.equal(book.items[0].id, item.id)
+  assert.equal(book.items[0].source.status, 'pending')
+  assert.equal(book.items[0].content, '')
+  assert.equal(book.items[0].localDirty, undefined)
+  assert.equal(book.items[0].localConflict, undefined)
+})
+
+test('新导入的资料写入本地时使用原始字节', async () => {
+  const root = new MemoryDirectory()
+  const bytes = new Uint8Array([80, 68, 70, 0, 255])
+  const source = {
+    id: makeId(),
+    type: 'file',
+    kind: 'source',
+    name: '报告.pdf',
+    parentId: null,
+    content: '不能写入这些提取文字',
+    source: { blob: new Blob([bytes]) },
+  }
+  await createLocalEntry(root, { items: [] }, source)
+  const file = await (await root.getFileHandle(source.name)).getFile()
+  assert.deepEqual(new Uint8Array(await file.arrayBuffer()), bytes)
+  assert.equal(source.diskContent, undefined)
+})
+
+test('未被索引的新资料也不能被父目录操作删除或移动', async () => {
+  const { root, vault } = await setup()
+  const folder = vault.items.find((item) => item.name === '分类')
+  await put(root, '分类/外部新增.pdf', 'pdf bytes')
+  await assert.rejects(deleteLocalEntry(root, vault, folder), /只读资料/)
+  await assert.rejects(
+    moveLocalEntry(root, vault, folder, '移动后'),
+    /只读资料/,
+  )
+  assert.ok(await root.getDirectoryHandle('分类'))
+})

@@ -1,5 +1,10 @@
-// 目录操作只使用标准句柄，不依赖浏览器缓存或目录上传。
-const notePattern = /\.(md|markdown|txt)$/i
+import {
+  isSource,
+  isSupportedName,
+  isDocumentName,
+  sourceFields,
+  assertMutableItem,
+} from './documents.js'
 const ignored = (name) =>
   name.startsWith('.') ||
   ['node_modules', '__MACOSX', '$RECYCLE.BIN'].includes(name)
@@ -24,7 +29,7 @@ export async function readDirectory(root, makeId) {
     for await (const [name, handle] of dir.entries()) {
       if (
         !ignored(name) &&
-        (handle.kind === 'directory' || notePattern.test(name))
+        (handle.kind === 'directory' || isSupportedName(name))
       )
         entries.push([name, handle])
     }
@@ -40,8 +45,11 @@ export async function readDirectory(root, makeId) {
       }
       if (item.type === 'file') {
         const file = await handle.getFile()
-        item.content = await file.text()
-        item.diskContent = item.content
+        if (isDocumentName(name)) Object.assign(item, await sourceFields(file))
+        else {
+          item.content = await file.text()
+          item.diskContent = item.content
+        }
         item.updatedAt = new Date(file.lastModified).toISOString()
         item.createdAt = item.updatedAt
       }
@@ -78,6 +86,16 @@ export function reconcileDirectory(vault, scanned) {
     if (previous?.type !== item.type) return item
     item.createdAt = previous.createdAt
     if (item.type === 'folder') item.updatedAt = previous.updatedAt
+    if (isSource(item)) {
+      if (
+        isSource(previous) &&
+        previous.source.fingerprint === item.source.fingerprint
+      ) {
+        item.source = previous.source
+        item.content = previous.content
+      }
+      return item
+    }
     if (item.type === 'file') {
       const dirty =
         previous.localDirty ||
@@ -200,6 +218,7 @@ export async function assertUnchanged(root, vault, item) {
 }
 
 export async function writeLocalFile(root, vault, item) {
+  if (isSource(item)) throw new Error('资料为只读，不能写回原文件')
   if (item.localConflict) throw conflict(item)
   await assertUnchanged(root, vault, item)
   const { dir, name } = await parentAt(root, localPath(vault, item))
@@ -219,7 +238,10 @@ export async function createLocalEntry(root, vault, item) {
   else {
     const handle = await dir.getFileHandle(name, { create: true })
     try {
-      await writeHandle(handle, item.content)
+      await writeHandle(
+        handle,
+        isSource(item) ? item.source.blob : item.content,
+      )
     } catch (error) {
       try {
         await dir.removeEntry(name)
@@ -228,12 +250,25 @@ export async function createLocalEntry(root, vault, item) {
       }
       throw error
     }
-    item.diskContent = item.content
-    item.localDirty = false
+    if (!isSource(item)) {
+      item.diskContent = item.content
+      item.localDirty = false
+    }
   }
 }
 
+async function assertNoDiskSources(entry) {
+  if (entry.kind === 'file') {
+    if (isDocumentName(entry.name))
+      throw new Error('本地目录包含只读资料，请先同步，未修改任何文件')
+    return
+  }
+  for await (const [name, child] of entry.entries())
+    if (!ignored(name)) await assertNoDiskSources(child)
+}
+
 export async function deleteLocalEntry(root, vault, item) {
+  assertMutableItem(vault, item.id)
   const path = localPath(vault, item)
   for (const file of vault.items.filter(
     (entry) =>
@@ -244,6 +279,8 @@ export async function deleteLocalEntry(root, vault, item) {
     await assertUnchanged(root, vault, file)
   }
   const { dir, name } = await parentAt(root, path)
+  if (item.type === 'folder')
+    await assertNoDiskSources(await dir.getDirectoryHandle(name))
   await dir.removeEntry(name, { recursive: item.type === 'folder' })
 }
 
@@ -285,6 +322,7 @@ async function snapshotEntry(handle) {
 }
 
 export async function moveLocalEntry(root, vault, item, destination) {
+  assertMutableItem(vault, item.id)
   const source = localPath(vault, item)
   if (source === destination) return
   if (source.toLowerCase() === destination.toLowerCase())
@@ -306,6 +344,7 @@ export async function moveLocalEntry(root, vault, item, destination) {
     item.type === 'folder'
       ? await from.dir.getDirectoryHandle(from.name)
       : await from.dir.getFileHandle(from.name)
+  await assertNoDiskSources(entry)
   const before = JSON.stringify(await snapshotEntry(entry))
   let created = false
   try {
@@ -335,4 +374,55 @@ export async function moveLocalEntry(root, vault, item, destination) {
       }
     throw error
   }
+}
+
+// 标准目录选取提供一次性快照，不声称具有本地写回权限。
+export async function readDirectoryFiles(files, makeId) {
+  const items = []
+  const folders = new Map([['', null]])
+  const names = new Set()
+  const ensureFolder = (path) => {
+    if (folders.has(path)) return folders.get(path)
+    const parts = path.split('/')
+    const name = parts.pop()
+    const parentId = ensureFolder(parts.join('/'))
+    const item = {
+      id: makeId(),
+      name,
+      parentId,
+      type: 'folder',
+      createdAt: now(),
+      updatedAt: now(),
+    }
+    items.push(item)
+    folders.set(path, item.id)
+    return item.id
+  }
+  for (const file of files) {
+    const parts = (file.webkitRelativePath || file.name).split('/')
+    if (file.webkitRelativePath) parts.shift()
+    if (
+      parts.some(
+        (part) => !part || part === '..' || part === '.' || part.includes('\\'),
+      )
+    )
+      throw new Error('目录路径不正确')
+    if (parts.some(ignored) || !isSupportedName(file.name)) continue
+    const key = parts.join('/').toLowerCase()
+    if (names.has(key)) throw new Error('目录中存在重名文件')
+    names.add(key)
+    const name = parts.pop()
+    const item = {
+      id: makeId(),
+      name,
+      type: 'file',
+      parentId: ensureFolder(parts.join('/')),
+      createdAt: new Date(file.lastModified || Date.now()).toISOString(),
+      updatedAt: new Date(file.lastModified || Date.now()).toISOString(),
+    }
+    if (isDocumentName(name)) Object.assign(item, await sourceFields(file))
+    else item.content = await file.text()
+    items.push(item)
+  }
+  return items
 }

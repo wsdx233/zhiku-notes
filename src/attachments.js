@@ -1,3 +1,9 @@
+import {
+  isDocumentName,
+  sourceFields,
+  ensureSourceParsed,
+  SOURCE_LIMITATIONS,
+} from './documents.js'
 import { createStore, get, setMany, delMany } from 'idb-keyval'
 import { makeId } from './storage.js'
 
@@ -22,13 +28,27 @@ function dataUrl(file) {
 }
 
 export async function prepareAttachment(file) {
+  if (isDocumentName(file.name)) {
+    const item = { type: 'file', ...(await sourceFields(file)) }
+    await ensureSourceParsed(item)
+    if (item.source.status === 'error') throw new Error(item.source.error)
+    if (!item.content.trim())
+      throw new Error('资料没有可读取文字，扫描件需要 OCR')
+    if (item.content.length > 60000)
+      throw new Error('资料较长，请通过添加资料导入知识库，供助手分段读取')
+    return {
+      id: makeId(),
+      name: file.name,
+      type: 'text',
+      payload: `${SOURCE_LIMITATIONS}\n${item.source.warnings.join('\n')}\n\n${item.content}`,
+    }
+  }
   const image = imageTypes.has(file.type)
   const text =
     file.type.startsWith('text/') ||
     ['application/json', 'application/xml'].includes(file.type) ||
     textExtension.test(file.name)
-  if (!image && !text)
-    throw new Error('请选择 PNG、JPEG、WebP、GIF 图片或文本文件')
+  if (!image && !text) throw new Error('请选择图片、文档或文本文件')
   const maxBytes = image ? 20 * 1024 * 1024 : 2 * 1024 * 1024
   if (file.size > maxBytes)
     throw new Error(image ? '图片不能超过 20 MB' : '文本附件不能超过 2 MB')
@@ -76,7 +96,10 @@ export async function resolveAttachmentMessages(messages) {
       for (const reference of attachments) {
         const attachment = await loadAttachment(reference.id)
         if (attachment.type === 'image') {
-          content.push({ type: 'text', text: `图片附件「${attachment.name}」` })
+          content.push({
+            type: 'text',
+            text: `图片附件「${attachment.name}」`,
+          })
           content.push({
             type: 'image_url',
             image_url: { url: attachment.payload },

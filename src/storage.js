@@ -1,7 +1,18 @@
 import JSZip from 'jszip'
+import {
+  isSource,
+  isDocumentName,
+  isSupportedName,
+  sourceFields,
+  sourceFormat,
+  assertMutableItem,
+  DOCUMENT_VERSION,
+  MAX_DOCUMENT_BYTES,
+} from './documents.js'
 import { createStore, get, set, del } from 'idb-keyval'
 import {
   readDirectory,
+  readDirectoryFiles,
   reconcileDirectory,
   writeLocalFile,
   createLocalEntry,
@@ -221,10 +232,13 @@ export async function saveDatabase(database) {
   // 小于 3MB 时作为只读兜底副本存一份到 localStorage
   try {
     if (typeof localStorage !== 'undefined') {
-      const str = JSON.stringify(database)
-      if (str.length < 3 * 1024 * 1024) {
-        localStorage.setItem(STORE_KEY, str)
+      if (database.vaults.some((vault) => vault.items.some(isSource))) {
+        localStorage.removeItem(STORE_KEY)
+        return
       }
+      const str = JSON.stringify(database)
+      if (str.length < 3 * 1024 * 1024) localStorage.setItem(STORE_KEY, str)
+      else localStorage.removeItem(STORE_KEY)
     }
   } catch {
     // 忽略 localStorage 配额超出错误
@@ -348,6 +362,7 @@ export async function syncLocalVaultFromDisk(vault) {
 }
 
 export async function writeItemToDisk(vault, item) {
+  if (isSource(item)) throw new Error('资料为只读，不能写回原文件')
   return diskTask(vault, async (handle) => {
     // 扫描可能已替换对象，始终根据稳定 ID 获取当前笔记。
     const current = vault.items.find((entry) => entry.id === item.id)
@@ -377,6 +392,7 @@ export async function createWorkspaceItem(
 }
 
 export async function deleteWorkspaceItem(vault, id) {
+  assertMutableItem(vault, id)
   const item = vault.items.find((entry) => entry.id === id)
   if (!item) throw new Error('文件不存在')
   if (vault.storageType === 'local')
@@ -445,8 +461,29 @@ export function validateVault(vault) {
     )
       throw new Error('知识库包含无效文件')
     validateName(item.name)
+    if (item.parentId === null && item.name.toLowerCase() === '.zhiku.json')
+      throw new Error('此名称为知识库备份保留名称')
     if (item.type === 'file' && typeof item.content !== 'string')
       throw new Error('笔记内容格式不正确')
+    if (isSource(item)) {
+      if (
+        !isDocumentName(item.name) ||
+        !item.source ||
+        !(item.source.blob instanceof Blob)
+      )
+        throw new Error('资料原件不完整，请重新导入原始文件或压缩包备份')
+      if (item.source.blob.size > MAX_DOCUMENT_BYTES)
+        throw new Error('单份资料不能超过 30 MB')
+      item.source.format = sourceFormat(item.name)
+      if (item.source.version !== DOCUMENT_VERSION) {
+        item.source.status = 'pending'
+        item.content = ''
+        item.source.chunks = []
+      }
+      delete item.diskContent
+      delete item.localDirty
+      delete item.localConflict
+    }
     item.createdAt = Number.isFinite(Date.parse(item.createdAt))
       ? item.createdAt
       : timestamp()
@@ -529,6 +566,7 @@ export function createItem(vault, type, name, parentId = null, content = '') {
 }
 
 export function renameItem(vault, id, name) {
+  assertMutableItem(vault, id)
   validateName(name)
   const item = vault.items.find((entry) => entry.id === id)
   if (!item) throw new Error('文件不存在')
@@ -540,6 +578,7 @@ export function renameItem(vault, id, name) {
 }
 
 export function moveItem(vault, id, parentId) {
+  assertMutableItem(vault, id)
   const item = vault.items.find((entry) => entry.id === id)
   if (!item) throw new Error('文件不存在')
   assertParent(vault, parentId)
@@ -554,6 +593,7 @@ export function moveItem(vault, id, parentId) {
 }
 
 export function deleteItem(vault, id) {
+  assertMutableItem(vault, id)
   const ids = new Set([id])
   for (let changed = true; changed;) {
     changed = false
@@ -578,10 +618,39 @@ export function itemPath(vault, item) {
 
 export async function exportVault(vault) {
   const zip = new JSZip()
-  zip.file('.zhiku.json', JSON.stringify({ version: 1, vault }, null, 2))
+  // 二进制原件放在实际路径，清单只保存元数据，不对 Blob 做 JSON 序列化。
+  const manifest = {
+    ...vault,
+    items: vault.items.map((item) => {
+      if (!isSource(item)) return item
+      const { blob, ...source } = item.source
+      return { ...item, source }
+    }),
+  }
+  const manifestText = JSON.stringify({ version: 2, vault: manifest }, null, 2)
+  const encoder = new TextEncoder()
+  const totalBytes =
+    encoder.encode(manifestText).length +
+    vault.items.reduce(
+      (total, item) =>
+        total +
+        (item.type === 'folder'
+          ? 0
+          : isSource(item)
+            ? item.source.blob.size
+            : encoder.encode(item.content).length),
+      0,
+    )
+  if (totalBytes > 100 * 1024 * 1024 || vault.items.length >= 10000)
+    throw new Error('备份超过导入限制，请先下载资料原件并拆分知识库')
+  zip.file('.zhiku.json', manifestText)
   for (const item of vault.items) {
     if (item.type === 'folder') zip.folder(itemPath(vault, item))
-    else zip.file(itemPath(vault, item), item.content)
+    else if (isSource(item)) {
+      if (!(item.source.blob instanceof Blob))
+        throw new Error('资料原件已丢失，无法导出')
+      zip.file(itemPath(vault, item), await item.source.blob.arrayBuffer())
+    } else zip.file(itemPath(vault, item), item.content)
   }
   return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' })
 }
@@ -603,11 +672,33 @@ export async function importVault(file) {
     const parsed = JSON.parse(await file.text())
     return browserVaultCopy(validateVault(parsed.vault || parsed))
   }
-  const zip = await JSZip.loadAsync(file)
+  const archive =
+    file instanceof Blob ? new Uint8Array(await file.arrayBuffer()) : file
+  const { validateDocumentArchive } = await import('./document-parser.js')
+  validateDocumentArchive(archive)
+  const zip = await JSZip.loadAsync(archive)
   const manifest = zip.file('.zhiku.json')
   if (manifest) {
     const parsed = JSON.parse(await manifest.async('string'))
-    return browserVaultCopy(validateVault(parsed.vault))
+    const restored = parsed.vault
+    if (!Array.isArray(restored?.items)) throw new Error('知识库格式不正确')
+    // 先验证树结构，再通过实际原件重建缓存，避免信任备份中的提取文本。
+    const tree = {
+      ...restored,
+      items: restored.items.map(({ kind, source, ...item }) => item),
+    }
+    validateVault(tree)
+    for (const item of restored.items.filter(isSource)) {
+      const original = zip.file(itemPath(tree, item))
+      if (!original) throw new Error(`备份缺少资料原件「${item.name}」`)
+      Object.assign(
+        item,
+        await sourceFields(
+          new File([await original.async('uint8array')], item.name),
+        ),
+      )
+    }
+    return browserVaultCopy(validateVault(restored))
   }
   const vault = {
     id: makeId(),
@@ -636,17 +727,66 @@ export async function importVault(file) {
       ensureFolder(entry.name.replace(/\/$/, ''))
       continue
     }
-    if (!/\.md$/i.test(entry.name)) continue
+    if (!isSupportedName(entry.name)) continue
     const parts = entry.name.split('/')
     const name = parts.pop()
-    createItem(
-      vault,
-      'file',
-      name,
-      ensureFolder(parts.join('/')),
-      await entry.async('string'),
-    )
+    const parentId = ensureFolder(parts.join('/'))
+    if (isDocumentName(name)) {
+      const fields = await sourceFields(
+        new File([await entry.async('uint8array')], name),
+      )
+      addSourceItem(vault, name, parentId, fields)
+    } else
+      createItem(vault, 'file', name, parentId, await entry.async('string'))
   }
-  if (!vault.items.length) throw new Error('压缩包中没有 Markdown 笔记')
+  if (!vault.items.length) throw new Error('压缩包中没有支持的笔记或资料')
+  return validateVault(vault)
+}
+
+function addSourceItem(vault, name, parentId, fields) {
+  validateName(name)
+  if (parentId === null && name.toLowerCase() === '.zhiku.json')
+    throw new Error('此名称为知识库备份保留名称')
+  assertParent(vault, parentId)
+  uniqueName(vault, name, parentId)
+  const item = {
+    id: makeId(),
+    name,
+    parentId,
+    type: 'file',
+    createdAt: timestamp(),
+    updatedAt: timestamp(),
+    ...fields,
+  }
+  vault.items.push(item)
+  vault.updatedAt = timestamp()
+  return item
+}
+
+export async function importSourceFile(vault, file, parentId = null) {
+  const fields = await sourceFields(file)
+  const draft = { ...vault, items: [...vault.items] }
+  const item = addSourceItem(draft, file.name, parentId, fields)
+  if (vault.storageType === 'local')
+    await diskTask(vault, (handle) => createLocalEntry(handle, vault, item))
+  vault.items.push(item)
+  vault.updatedAt = timestamp()
+  return item
+}
+
+export async function createDirectorySnapshot(files) {
+  if (!files.length) throw new Error('没有选中文件，目录快照不支持空文件夹')
+  const name = files[0].webkitRelativePath?.split('/')[0] || '文件夹快照'
+  const vault = {
+    id: makeId(),
+    name,
+    storageType: 'browser',
+    directorySnapshot: true,
+    items: await readDirectoryFiles(files, makeId),
+    createdAt: timestamp(),
+    updatedAt: timestamp(),
+  }
+  if (!vault.items.some((item) => item.type === 'file'))
+    throw new Error('文件夹中没有支持的笔记或资料')
   return validateVault(vault)
 }

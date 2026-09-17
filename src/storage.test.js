@@ -38,7 +38,7 @@ test('生成唯一知识库标识', () => {
   for (const id of ids) assert.match(id, /^[\w-]{36}$/)
 })
 
-test('非安全上下文明确拒绝直连，不创建目录上传控件', async (t) => {
+test('底层直连在非安全上下文明确拒绝，界面另行提供目录快照', async (t) => {
   const picker = t.mock.fn()
   const createElement = pickerEnvironment(t, picker, false)
   assert.equal(isLocalDirectoryAccessSupported(), false)
@@ -48,7 +48,7 @@ test('非安全上下文明确拒绝直连，不创建目录上传控件', async
   assert.equal(createElement.mock.callCount(), 0)
 })
 
-test('缺少目录句柄能力时不退回文件夹导入', async (t) => {
+test('底层直连缺少目录句柄时保持失败，不伪造写回能力', async (t) => {
   const createElement = pickerEnvironment(t, undefined)
   assert.equal(isFileSystemAccessSupported(), false)
   await assert.rejects(createLocalDirectoryVault(), /Chrome/)
