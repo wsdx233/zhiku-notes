@@ -6,6 +6,7 @@ import {
   sourceFields,
   sourceFormat,
   assertMutableItem,
+  containsSource,
   DOCUMENT_VERSION,
   MAX_DOCUMENT_BYTES,
 } from './documents.js'
@@ -392,9 +393,10 @@ export async function createWorkspaceItem(
 }
 
 export async function deleteWorkspaceItem(vault, id) {
-  assertMutableItem(vault, id)
   const item = vault.items.find((entry) => entry.id === id)
   if (!item) throw new Error('文件不存在')
+  if (item.type === 'folder' && containsSource(vault, id))
+    throw new Error('包含只读资料，不能删除文件夹，请先删除其中的资料')
   if (vault.storageType === 'local')
     await diskTask(vault, async (handle) => {
       await deleteLocalEntry(handle, vault, item)
@@ -593,7 +595,10 @@ export function moveItem(vault, id, parentId) {
 }
 
 export function deleteItem(vault, id) {
-  assertMutableItem(vault, id)
+  const target = vault.items.find((entry) => entry.id === id)
+  if (!target) return
+  if (target.type === 'folder' && containsSource(vault, id))
+    throw new Error('包含只读资料，不能删除文件夹，请先删除其中的资料')
   const ids = new Set([id])
   for (let changed = true; changed;) {
     changed = false

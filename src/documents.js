@@ -2,8 +2,8 @@
 export const DOCUMENT_VERSION = 'docmarrow-1.1.1-v1'
 export const MAX_DOCUMENT_BYTES = 30 * 1024 * 1024
 export const NOTE_PATTERN = /\.(md|markdown|txt)$/i
-const parsedFormats = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'html', 'htm'])
-const textFormats = new Set([
+export const parsedFormats = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'html', 'htm'])
+export const textFormats = new Set([
   'csv',
   'tsv',
   'json',
@@ -16,7 +16,20 @@ const textFormats = new Set([
   'toml',
   'rst',
 ])
-export const DOCUMENT_ACCEPT = [...parsedFormats, ...textFormats]
+export const imageFormats = new Set([
+  'png',
+  'jpg',
+  'jpeg',
+  'webp',
+  'gif',
+  'bmp',
+  'svg',
+])
+export const DOCUMENT_ACCEPT = [
+  ...parsedFormats,
+  ...textFormats,
+  ...imageFormats,
+]
   .map((ext) => `.${ext}`)
   .join(',')
 export const SOURCE_LIMITATIONS =
@@ -25,10 +38,15 @@ export const isSource = (item) =>
   item?.type === 'file' && item.kind === 'source'
 export const sourceFormat = (name) =>
   String(name).split('.').pop().toLowerCase()
+export const isImageSource = (format) => imageFormats.has(format)
 export const isDocumentName = (name) =>
+  parsedFormats.has(sourceFormat(name)) ||
+  textFormats.has(sourceFormat(name)) ||
+  imageFormats.has(sourceFormat(name))
+export const isSyncableDocument = (name) =>
   parsedFormats.has(sourceFormat(name)) || textFormats.has(sourceFormat(name))
 export const isSupportedName = (name) =>
-  NOTE_PATTERN.test(name) || isDocumentName(name)
+  NOTE_PATTERN.test(name) || isSyncableDocument(name)
 export const isTextSource = (format) => textFormats.has(format)
 
 export async function sourceFingerprint(blob) {
@@ -85,8 +103,11 @@ export function containsSource(vault, id) {
 }
 
 export function assertMutableItem(vault, id) {
+  const item = vault.items.find((entry) => entry.id === id)
+  if (isSource(item))
+    throw new Error('资料为只读，不能修改资料内容或移动、重命名')
   if (containsSource(vault, id))
-    throw new Error('资料为只读，不能修改资料或移动、重命名、删除其所在文件夹')
+    throw new Error('包含只读资料，不能移动或重命名其所在文件夹')
 }
 
 const parsing = new WeakMap()

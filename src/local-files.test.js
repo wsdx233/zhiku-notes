@@ -431,7 +431,8 @@ test('扫描资料保留二进制原件，不作为文本笔记写回', async ()
     bytes,
   )
   await assert.rejects(writeLocalFile(root, { items }, source), /只读/)
-  await assert.rejects(deleteLocalEntry(root, { items }, source), /只读/)
+  await deleteLocalEntry(root, { items }, source)
+  assert.equal(root.children.get('资料').children.has('报告.docx'), false)
   const folder = items.find((item) => item.type === 'folder')
   await assert.rejects(
     moveLocalEntry(root, { items }, folder, '新目录'),

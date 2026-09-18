@@ -1,4 +1,4 @@
-import { isTextSource, MAX_DOCUMENT_BYTES } from './documents.js'
+import { isTextSource, isImageSource, MAX_DOCUMENT_BYTES } from './documents.js'
 
 // 在解压之前读取中央目录，避免压缩炸弹。拒绝加密 ZIP、分卷与 ZIP64。
 export function validateDocumentArchive(bytes) {
@@ -59,6 +59,13 @@ export function splitSourceText(text, { pages = [], path = [] } = {}) {
 export async function parseSourceBytes(bytes, format) {
   if (bytes.length > MAX_DOCUMENT_BYTES)
     throw new Error('单份资料不能超过 30 MB')
+  if (isImageSource(format)) {
+    return {
+      text: '',
+      chunks: [],
+      warnings: ['图片暂无转写文本，扫描件需要识别后引用'],
+    }
+  }
   if (isTextSource(format)) {
     let text
     try {

@@ -118,10 +118,13 @@ test('只读保护同时覆盖资料和包含资料的父文件夹', async () =>
     assert.throws(() => assertMutableItem(book, id), /只读/)
     assert.throws(() => renameItem(book, id, '新名称'), /只读/)
     assert.throws(() => moveItem(book, id, null), /只读/)
-    assert.throws(() => deleteItem(book, id), /只读/)
   }
+  assert.throws(() => deleteItem(book, folder.id), /只读/)
   await assert.rejects(writeItemToDisk(book, item), /只读/)
   assert.equal(book.items.length, 2)
+  deleteItem(book, item.id)
+  assert.equal(book.items.length, 1)
+  assert.equal(book.items[0].id, folder.id)
 })
 
 test('备份往返保留二进制原件和资料身份，不信任导入的解析缓存', async () => {
@@ -245,4 +248,19 @@ test('原件不能占用备份清单路径', async () => {
     importSourceFile(vault(), new File(['{}'], '.zhiku.json')),
     /保留名称/,
   )
+})
+
+test('支持导入图片资料并在知识库中删除', async () => {
+  const book = vault()
+  const image = new File([new Uint8Array([137, 80, 78, 71])], '插图.png', {
+    type: 'image/png',
+  })
+  const item = await importSourceFile(book, image, null)
+  assert.equal(item.kind, 'source')
+  assert.equal(item.source.format, 'png')
+  await ensureSourceParsed(item)
+  assert.equal(item.content, '')
+  assert.equal(book.items.length, 1)
+  deleteItem(book, item.id)
+  assert.equal(book.items.length, 0)
 })

@@ -28,7 +28,8 @@ function dataUrl(file) {
 }
 
 export async function prepareAttachment(file) {
-  if (isDocumentName(file.name)) {
+  const image = imageTypes.has(file.type)
+  if (!image && isDocumentName(file.name)) {
     const item = { type: 'file', ...(await sourceFields(file)) }
     await ensureSourceParsed(item)
     if (item.source.status === 'error') throw new Error(item.source.error)
@@ -43,7 +44,6 @@ export async function prepareAttachment(file) {
       payload: `${SOURCE_LIMITATIONS}\n${item.source.warnings.join('\n')}\n\n${item.content}`,
     }
   }
-  const image = imageTypes.has(file.type)
   const text =
     file.type.startsWith('text/') ||
     ['application/json', 'application/xml'].includes(file.type) ||

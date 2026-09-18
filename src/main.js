@@ -4,11 +4,13 @@ import {
   SOURCE_LIMITATIONS,
   isSource,
   isTextSource,
+  isImageSource,
   ensureSourceParsed,
   isSourceParsing,
   containsSource,
   assertMutableItem,
 } from './documents.js'
+import { renderPdfToContainer } from './pdf-preview.js'
 import {
   knowledgeSummary,
   readKnowledgeFile,
@@ -110,6 +112,7 @@ const state = {
   graphQuery: '',
   hideIsolated: false,
   saved: true,
+  sourceView: 'image',
   wikiSuggest: {
     open: false,
     query: '',
@@ -129,6 +132,21 @@ let cacheWrites = 0
 let refreshRunning = false
 let dialogSubmitting = false
 const treeScrollPositions = new Map()
+const sourceBlobUrls = new Map()
+
+function getSourceBlobUrl(id, blob) {
+  if (sourceBlobUrls.has(id)) return sourceBlobUrls.get(id)
+  const url = URL.createObjectURL(blob)
+  sourceBlobUrls.set(id, url)
+  return url
+}
+
+function revokeSourceBlobUrl(id) {
+  if (sourceBlobUrls.has(id)) {
+    URL.revokeObjectURL(sourceBlobUrls.get(id))
+    sourceBlobUrls.delete(id)
+  }
+}
 
 const escape = (value = '') =>
   String(value).replace(
@@ -378,7 +396,15 @@ function selectFile(id) {
   if (!vault().items.some((item) => item.id === id && item.type === 'file'))
     return
   state.selectedId = id
-  if (isSource(selected())) state.mode = 'read'
+  if (isSource(selected())) {
+    state.mode = 'read'
+    const fmt = selected().source?.format
+    if (isImageSource(fmt) || fmt === 'pdf') {
+      state.sourceView = 'image'
+    } else {
+      state.sourceView = 'text'
+    }
+  }
   state.page = 'note'
   state.sidebarOpen = false
   state.menu = null
@@ -388,6 +414,35 @@ function selectFile(id) {
   render()
   const documentScroll = document.querySelector('.document-scroll')
   if (documentScroll) documentScroll.scrollTop = 0
+}
+
+let pdfRenderController = null
+
+async function mountPdfViewers() {
+  const viewer = document.querySelector('.source-pdf-viewer[data-source-id]')
+  if (!viewer) {
+    if (pdfRenderController) {
+      pdfRenderController.abort()
+      pdfRenderController = null
+    }
+    return
+  }
+  const sourceId = viewer.dataset.sourceId
+  const file = vault().items.find((item) => item.id === sourceId)
+  if (!file || !isSource(file) || !file.source?.blob) return
+
+  if (pdfRenderController) {
+    pdfRenderController.abort()
+  }
+  pdfRenderController = new AbortController()
+  const signal = pdfRenderController.signal
+
+  try {
+    await renderPdfToContainer(viewer, file.source.blob, signal)
+  } catch (error) {
+    if (signal.aborted || !viewer.isConnected) return
+    viewer.innerHTML = `<div class="source-empty" role="alert">${icon('error')}<h2>页面渲染失败</h2><p>${escape(error.message || '无法读取文档页面')}</p></div>`
+  }
 }
 
 function render() {
@@ -428,6 +483,7 @@ function render() {
     bindGraphNavigation(document.querySelector('.graph-page'))
   if (state.aiOpen)
     void fillAttachmentPreviews(document.querySelector('#ai-messages'))
+  void mountPdfViewers()
   if (state.modal) {
     requestAnimationFrame(() => {
       const input =
@@ -553,6 +609,13 @@ function sourceIcon(file) {
       xlsx: 'table_chart',
       html: 'language',
       htm: 'language',
+      png: 'image',
+      jpg: 'image',
+      jpeg: 'image',
+      webp: 'image',
+      gif: 'image',
+      bmp: 'image',
+      svg: 'image',
     }[file.source.format] || 'draft'
   )
 }
@@ -564,17 +627,46 @@ function renderSource(file) {
     source.version !== DOCUMENT_VERSION ||
     isSourceParsing(file)
   const warnings = [SOURCE_LIMITATIONS, ...(source.warnings || [])]
-  const body = pending
-    ? `<div class="source-empty" role="status">${icon('hourglass_top')}<h2>正在解析资料</h2><p>文件保留在本机，解析完成后可供知识助手读取</p></div>`
-    : source.status === 'error'
-      ? `<div class="source-empty" role="alert">${icon('error')}<h2>暂时无法预览</h2><p>${escape(source.error)}</p><button class="text-button" data-action="retry-source">重新解析</button></div>`
-      : !file.content.trim()
-        ? `<div class="source-empty">${icon('find_in_page')}<h2>没有提取到文字</h2><p>扫描件需要 OCR，当前版本不包含文字识别</p></div>`
-        : isTextSource(source.format)
-          ? `<pre class="source-text">${escape(file.content)}</pre>`
-          : `<article class="markdown-body source-body">${DOMPurify.sanitize(renderMarkdown(file.content, vault().items, file.id), { FORBID_TAGS: ['img', 'picture', 'source', 'video', 'audio', 'iframe', 'object', 'embed', 'style', 'link', 'svg'], FORBID_ATTR: ['style', 'src', 'srcset', 'poster', 'background'] })}</article>`
+  const isImage = isImageSource(source.format)
+  const isPdf = source.format === 'pdf'
+  const isImageView = state.sourceView === 'image'
+
+  let body
+  if (isImageView) {
+    if (isImage) {
+      const url = getSourceBlobUrl(file.id, source.blob)
+      body = `<div class="source-image-viewer"><img src="${url}" alt="${escape(file.name)}" class="source-image-preview"></div>`
+    } else if (isPdf) {
+      body = `<div class="source-pdf-viewer" data-source-id="${file.id}"><div class="pdf-loading">${icon('progress_activity', 'spin')}<span>正在渲染页面</span></div></div>`
+    } else {
+      body = `<div class="source-empty">${icon('image_not_supported')}<h2>当前格式暂无图片预览</h2><p>该格式请切换至转写文本模式查看，或下载原件在本地查看</p><button type="button" class="filled-button" data-action="set-source-view" data-view="text">查看转写文本</button></div>`
+    }
+  } else {
+    body = pending
+      ? `<div class="source-empty" role="status">${icon('hourglass_top')}<h2>正在解析资料</h2><p>文件保留在本机，解析完成后可供知识助手读取</p></div>`
+      : source.status === 'error'
+        ? `<div class="source-empty" role="alert">${icon('error')}<h2>暂时无法预览</h2><p>${escape(source.error)}</p><button class="text-button" data-action="retry-source">重新解析</button></div>`
+        : !file.content.trim()
+          ? `<div class="source-empty">${icon('find_in_page')}<h2>没有提取到文字</h2><p>扫描件与图片需要文字识别，当前版本不包含文字识别</p></div>`
+          : isTextSource(source.format)
+            ? `<pre class="source-text">${escape(file.content)}</pre>`
+            : `<article class="markdown-body source-body">${DOMPurify.sanitize(renderMarkdown(file.content, vault().items, file.id), { FORBID_TAGS: ['img', 'picture', 'source', 'video', 'audio', 'iframe', 'object', 'embed', 'style', 'link', 'svg'], FORBID_ATTR: ['style', 'src', 'srcset', 'poster', 'background'] })}</article>`
+  }
+
   return `<section class="note-workspace source-workspace">
-    <div class="note-toolbar"><div class="source-label">${icon('lock')}<span>只读资料</span><span class="source-format">${escape(source.format.toUpperCase())}</span></div><div class="note-toolbar-right">${iconButton('download', 'download-source', '下载原件')}${iconButton('refresh', 'retry-source', '重新解析')}${iconButton('link', 'copy-link', '复制双链')}</div></div>
+    <div class="note-toolbar">
+      <div class="view-switch" aria-label="资料视图">
+        <button class="${isImageView ? 'active' : ''}" data-action="set-source-view" data-view="image">${icon('image')}<span>图片</span></button>
+        <button class="${!isImageView ? 'active' : ''}" data-action="set-source-view" data-view="text">${icon('text_snippet')}<span>转写文本</span></button>
+      </div>
+      <div class="source-label">${icon('lock')}<span>只读资料</span><span class="source-format">${escape(source.format.toUpperCase())}</span></div>
+      <div class="note-toolbar-right">
+        ${iconButton('download', 'download-source', '下载原件')}
+        ${iconButton('refresh', 'retry-source', '重新解析')}
+        ${iconButton('link', 'copy-link', '复制双链')}
+        ${iconButton('delete', 'delete-source', '删除文件')}
+      </div>
+    </div>
     <div class="document-scroll"><div class="document-page source-page"><header class="source-heading"><h1>${escape(file.name)}</h1><p>${escape(itemPath(vault(), file))}</p></header><div class="source-notice">${icon('info')}<div>${warnings.map((warning) => `<p>${escape(warning)}</p>`).join('')}</div></div>${body}</div></div>
     <footer class="note-status"><span>${icon(sourceIcon(file))}<span>${Math.max(1, Math.ceil(source.size / 1024))} KB</span></span><span>${icon('manage_search')}<span>${pending ? '正在建立索引' : source.status === 'error' ? '解析失败' : source.chunks.length ? '可供知识助手读取' : '暂无可读取文字'}</span></span></footer>
   </section>`
@@ -709,7 +801,7 @@ function renderMenu() {
   const item = vault().items.find((entry) => entry.id === state.menu.id)
   if (!item) return ''
   if (isSource(item))
-    return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu"><button data-action="download-source" data-id="${item.id}">${icon('download')}下载原件</button><button data-action="retry-source" data-id="${item.id}">${icon('refresh')}重新解析</button></div>`
+    return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu"><button data-action="download-source" data-id="${item.id}">${icon('download')}下载原件</button><button data-action="retry-source" data-id="${item.id}">${icon('refresh')}重新解析</button><div class="menu-divider"></div><button class="danger" data-action="delete-item">${icon('delete')}删除</button></div>`
   if (containsSource(vault(), item.id))
     return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu"><button data-action="new-child-note">${icon('note_add')}新建笔记</button><button data-action="new-child-folder">${icon('create_new_folder')}新建文件夹</button><p class="source-menu-hint">包含只读资料，不能移动或删除</p></div>`
   return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu">${item.type === 'folder' ? '<button data-action="new-child-note">' + icon('note_add') + '新建笔记</button><button data-action="new-child-folder">' + icon('create_new_folder') + '新建文件夹</button>' : ''}<button data-action="rename-item">${icon('drive_file_rename_outline')}重命名</button><button data-action="move-item">${icon('drive_file_move')}移动到</button>${item.type === 'file' ? '<button data-action="download-note">' + icon('download') + '下载 Markdown</button>' : ''}<div class="menu-divider"></div><button class="danger" data-action="delete-item">${icon('delete')}删除</button></div>`
@@ -762,8 +854,11 @@ function renderModal() {
         <p>${directAccess ? '选择文件夹并授权读写，笔记修改自动写回，资料保持只读。支持空文件夹，名称沿用所选文件夹。' : '当前环境使用标准目录选取，导入为浏览器快照，不会写回本地。不支持空目录。'}</p>
       </div>`
   } else if (modal.type === 'connections') body = connectionContent()
-  else if (modal.type === 'delete')
-    body = `<p class="dialog-description">确定删除「${escape(modal.name)}」吗？${modal.vaultId ? (database.vaults.find((entry) => entry.id === modal.vaultId)?.storageType === 'local' ? '只移除知识库连接和对话，不会删除本地文件。' : '这会删除该知识库的全部笔记和对话。') : '文件夹中的内容也会一并删除。'}此操作无法撤销，请先导出备份。</p>`
+  else if (modal.type === 'delete') {
+    const targetItem = vault().items.find((entry) => entry.id === modal.id)
+    const isFolder = targetItem?.type === 'folder'
+    body = `<p class="dialog-description">确定删除「${escape(modal.name)}」吗？${modal.vaultId ? (database.vaults.find((entry) => entry.id === modal.vaultId)?.storageType === 'local' ? '只移除知识库连接和对话，不会删除本地文件。' : '这会删除该知识库的全部笔记和对话。') : isFolder ? '文件夹中的内容也会一并删除。' : ''}此操作无法撤销，请先导出备份。</p>`
+  }
   else if (modal.type === 'move')
     body = `<label class="form-field"><span>目标文件夹</span><select name="parentId">${folderOptions(modal.id)}</select></label>`
   else
@@ -864,11 +959,33 @@ async function handleAction(action, target) {
   else if (action === 'delete-vault') {
     if (state.aiBusy) return notify('请先停止当前对话')
     showModal('delete', { vaultId: vault().id, name: vault().name })
+  }  else if (action === 'delete-source') {
+    const file =
+      vault().items.find((item) => item.id === target.dataset.id) ||
+      menuItem ||
+      selected()
+    if (!file || !isSource(file)) return
+    state.menu = null
+    showModal('delete', { id: file.id, name: file.name })
+  } else if (action === 'set-source-view') {
+    const btn = target.closest('[data-view]')
+    const view = btn?.dataset.view
+    if (view && ['image', 'text'].includes(view)) {
+      state.sourceView = view
+      render()
+    }
   } else if (action === 'rename-item')
     showModal('rename', { id: menuItem.id, value: extractTitle(menuItem) })
   else if (action === 'move-item') showModal('move', { id: menuItem.id })
-  else if (action === 'delete-item')
-    showModal('delete', { id: menuItem.id, name: extractTitle(menuItem) })
+  else if (action === 'delete-item') {
+    const targetItem =
+      vault().items.find((item) => item.id === target.dataset.id) ||
+      menuItem ||
+      selected()
+    if (!targetItem) return
+    state.menu = null
+    showModal('delete', { id: targetItem.id, name: extractTitle(targetItem) })
+  }
   else if (action === 'download-note') {
     download(
       new Blob([menuItem.content], { type: 'text/markdown;charset=utf-8' }),
@@ -1332,7 +1449,16 @@ app.addEventListener('submit', async (event) => {
       } else {
         const targetVault = vault()
         await flushLocalWrites(targetVault)
+        revokeSourceBlobUrl(modal.id)
         await deleteWorkspaceItem(targetVault, modal.id)
+        if (state.selectedId === modal.id) {
+          const remaining = targetVault.items.filter(
+            (entry) => entry.type === 'file',
+          )
+          state.selectedId = remaining[0]?.id || null
+          database.selections ||= {}
+          database.selections[targetVault.id] = state.selectedId
+        }
       }
     }
     const saved = save()

@@ -3,7 +3,11 @@ import {
   isSupportedName,
   isDocumentName,
   sourceFields,
+  sourceFormat,
+  parsedFormats,
+  textFormats,
   assertMutableItem,
+  containsSource,
 } from './documents.js'
 const ignored = (name) =>
   name.startsWith('.') ||
@@ -259,7 +263,8 @@ export async function createLocalEntry(root, vault, item) {
 
 async function assertNoDiskSources(entry) {
   if (entry.kind === 'file') {
-    if (isDocumentName(entry.name))
+    const ext = sourceFormat(entry.name)
+    if (parsedFormats.has(ext) || textFormats.has(ext))
       throw new Error('本地目录包含只读资料，请先同步，未修改任何文件')
     return
   }
@@ -268,7 +273,8 @@ async function assertNoDiskSources(entry) {
 }
 
 export async function deleteLocalEntry(root, vault, item) {
-  assertMutableItem(vault, item.id)
+  if (item.type === 'folder' && containsSource(vault, item.id))
+    throw new Error('包含只读资料，不能删除文件夹，请先删除其中的资料')
   const path = localPath(vault, item)
   for (const file of vault.items.filter(
     (entry) =>
@@ -276,7 +282,7 @@ export async function deleteLocalEntry(root, vault, item) {
       (entry.id === item.id || localPath(vault, entry).startsWith(path + '/')),
   )) {
     if (file.localDirty) throw new Error('请先保存待写入的笔记，再删除')
-    await assertUnchanged(root, vault, file)
+    if (!isSource(file)) await assertUnchanged(root, vault, file)
   }
   const { dir, name } = await parentAt(root, path)
   if (item.type === 'folder')
