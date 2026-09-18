@@ -84,6 +84,11 @@ try {
       {},
       { timeout: 90000 },
     )
+    if (ext === 'pdf') {
+      await page
+        .locator('[data-action="set-source-view"][data-view="text"]')
+        .click()
+    }
     const text = await page.locator('.source-page').innerText()
     assert.ok(
       text.includes(ext === 'pdf' ? 'Knowledge PDF text' : '资料测试正文'),
@@ -196,7 +201,7 @@ try {
         args = { id: sourceId, parentId: null }
       }
       if (round === 6) {
-        assert.match(result.error, /只读/)
+        assert.equal(result.name, '资料.docx')
         tool = 'delete_item'
         args = { id: parentId }
       }
@@ -309,6 +314,9 @@ try {
   await offline
     .locator('#source-input')
     .setInputFiles(join(temporary, '资料.pdf'))
+  await offline
+    .locator('[data-action="set-source-view"][data-view="text"]')
+    .click()
   await offline.waitForFunction(
     () =>
       document

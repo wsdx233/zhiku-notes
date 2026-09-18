@@ -117,8 +117,12 @@ test('只读保护同时覆盖资料和包含资料的父文件夹', async () =>
   for (const id of [item.id, folder.id]) {
     assert.throws(() => assertMutableItem(book, id), /只读/)
     assert.throws(() => renameItem(book, id, '新名称'), /只读/)
-    assert.throws(() => moveItem(book, id, null), /只读/)
   }
+  assert.throws(() => moveItem(book, folder.id, null), /只读/)
+  moveItem(book, item.id, null)
+  assert.equal(book.items.find((entry) => entry.id === item.id).parentId, null)
+  moveItem(book, item.id, folder.id)
+  assert.equal(book.items.find((entry) => entry.id === item.id).parentId, folder.id)
   assert.throws(() => deleteItem(book, folder.id), /只读/)
   await assert.rejects(writeItemToDisk(book, item), /只读/)
   assert.equal(book.items.length, 2)
@@ -263,4 +267,36 @@ test('支持导入图片资料并在知识库中删除', async () => {
   assert.equal(book.items.length, 1)
   deleteItem(book, item.id)
   assert.equal(book.items.length, 0)
+})
+
+test('支持直接移动其他文档资料到不同文件夹', async () => {
+  const book = vault()
+  const folderA = createItem(book, 'folder', '目录甲')
+  const folderB = createItem(book, 'folder', '目录乙')
+  const pdf = await importSourceFile(
+    book,
+    new File([new Uint8Array([37, 80, 68, 70])], '文档.pdf'),
+    folderA.id,
+  )
+  assert.equal(pdf.parentId, folderA.id)
+  moveItem(book, pdf.id, folderB.id)
+  assert.equal(pdf.parentId, folderB.id)
+  moveItem(book, pdf.id, null)
+  assert.equal(pdf.parentId, null)
+})
+
+test('在目标文件夹存在同名文件时移动资料会报错', async () => {
+  const book = vault()
+  const folder = createItem(book, 'folder', '目标目录')
+  await importSourceFile(
+    book,
+    new File([new Uint8Array([37, 80, 68, 70])], '报告.pdf'),
+    folder.id,
+  )
+  const source = await importSourceFile(
+    book,
+    new File([new Uint8Array([37, 80, 68, 70])], '报告.pdf'),
+    null,
+  )
+  assert.throws(() => moveItem(book, source.id, folder.id), /同名/)
 })

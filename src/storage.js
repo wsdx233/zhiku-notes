@@ -580,9 +580,11 @@ export function renameItem(vault, id, name) {
 }
 
 export function moveItem(vault, id, parentId) {
-  assertMutableItem(vault, id)
   const item = vault.items.find((entry) => entry.id === id)
   if (!item) throw new Error('文件不存在')
+  if (item.type === 'folder' && containsSource(vault, id))
+    throw new Error('包含只读资料，不能移动或重命名其所在文件夹')
+  if (item.parentId === parentId) return
   assertParent(vault, parentId)
   let parent = parentId
   while (parent) {

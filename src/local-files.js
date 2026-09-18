@@ -328,7 +328,8 @@ async function snapshotEntry(handle) {
 }
 
 export async function moveLocalEntry(root, vault, item, destination) {
-  assertMutableItem(vault, item.id)
+  if (item.type === 'folder' && containsSource(vault, item.id))
+    throw new Error('包含只读资料，不能移动或重命名其所在文件夹')
   const source = localPath(vault, item)
   if (source === destination) return
   if (source.toLowerCase() === destination.toLowerCase())
@@ -340,7 +341,7 @@ export async function moveLocalEntry(root, vault, item, destination) {
         localPath(vault, entry).startsWith(source + '/')),
   )) {
     if (file.localDirty) throw new Error('请先保存待写入的笔记，再移动或重命名')
-    await assertUnchanged(root, vault, file)
+    if (!isSource(file)) await assertUnchanged(root, vault, file)
   }
   const from = await parentAt(root, source)
   const to = await parentAt(root, destination)
@@ -350,7 +351,7 @@ export async function moveLocalEntry(root, vault, item, destination) {
     item.type === 'folder'
       ? await from.dir.getDirectoryHandle(from.name)
       : await from.dir.getFileHandle(from.name)
-  await assertNoDiskSources(entry)
+  if (item.type === 'folder') await assertNoDiskSources(entry)
   const before = JSON.stringify(await snapshotEntry(entry))
   let created = false
   try {

@@ -9,6 +9,8 @@ import {
   isSourceParsing,
   containsSource,
   assertMutableItem,
+  NOTE_PATTERN,
+  isDocumentName,
 } from './documents.js'
 import { renderPdfToContainer } from './pdf-preview.js'
 import {
@@ -92,6 +94,7 @@ window
 
 const state = {
   selectedId: database.selections?.[database.activeId] || 'welcome',
+  activeFolderId: null,
   page: 'note',
   mode: 'read',
   search: '',
@@ -393,12 +396,15 @@ function ensureSelection() {
 }
 
 function selectFile(id) {
-  if (!vault().items.some((item) => item.id === id && item.type === 'file'))
-    return
+  const item = vault().items.find(
+    (entry) => entry.id === id && entry.type === 'file',
+  )
+  if (!item) return
   state.selectedId = id
-  if (isSource(selected())) {
+  state.activeFolderId = item.parentId || null
+  if (isSource(item)) {
     state.mode = 'read'
-    const fmt = selected().source?.format
+    const fmt = item.source?.format
     if (isImageSource(fmt) || fmt === 'pdf') {
       state.sourceView = 'image'
     } else {
@@ -414,6 +420,18 @@ function selectFile(id) {
   render()
   const documentScroll = document.querySelector('.document-scroll')
   if (documentScroll) documentScroll.scrollTop = 0
+}
+
+function getCurrentFolderId() {
+  if (
+    state.activeFolderId &&
+    vault().items.some(
+      (item) => item.id === state.activeFolderId && item.type === 'folder',
+    )
+  ) {
+    return state.activeFolderId
+  }
+  return selected()?.parentId || null
 }
 
 let pdfRenderController = null
@@ -520,7 +538,10 @@ function renderTree(parentId, depth = 0) {
       .map((item) => {
         const isFolder = item.type === 'folder'
         const closed = state.collapsed.has(item.id)
-        return `<div class="tree-branch"><div class="tree-row ${isFolder ? 'folder-row' : 'note-row'} ${item.id === state.selectedId && state.page === 'note' ? 'selected' : ''}" style="--depth:${Math.min(depth, 8)}" data-tree-id="${item.id}" draggable="${!containsSource(vault(), item.id)}">
+        const isSelected = isFolder
+          ? item.id === getCurrentFolderId() && !selected()
+          : item.id === state.selectedId && state.page === 'note'
+        return `<div class="tree-branch"><div class="tree-row ${isFolder ? 'folder-row' : 'note-row'} ${isSelected ? 'selected' : ''}" style="--depth:${Math.min(depth, 8)}" data-tree-id="${item.id}" draggable="${item.type === 'file' || !containsSource(vault(), item.id)}">
       <button class="tree-open" ${isFolder ? `data-folder="${item.id}" aria-expanded="${!closed}"` : `data-select="${item.id}"`} title="${escape(item.name)}">${isFolder ? icon(closed ? 'chevron_right' : 'expand_more', 'chevron') + icon('folder', 'folder-icon') : icon(isSource(item) ? sourceIcon(item) : 'article', 'file-icon')}<span>${escape(extractTitle(item))}</span></button>
       <button class="tree-more" data-item-menu="${item.id}" aria-label="${escape(extractTitle(item))}的操作">${icon('more_horiz')}</button>
     </div>${isFolder && !closed ? renderTree(item.id, depth + 1) : ''}</div>`
@@ -551,7 +572,8 @@ function renderTopbar() {
   const file = selected()
   const currentVault = vault()
   const isLocal = currentVault.storageType === 'local'
-  const parent = currentVault.items.find((item) => item.id === file?.parentId)
+  const parentId = file ? file.parentId : getCurrentFolderId()
+  const parent = currentVault.items.find((item) => item.id === parentId)
   const currentTheme = database.settings.theme || 'system'
   const themeIcon =
     currentTheme === 'dark'
@@ -629,7 +651,7 @@ function renderSource(file) {
   const warnings = [SOURCE_LIMITATIONS, ...(source.warnings || [])]
   const isImage = isImageSource(source.format)
   const isPdf = source.format === 'pdf'
-  const isImageView = state.sourceView === 'image'
+  const isImageView = state.sourceView === 'image' && (isImage || isPdf)
 
   let body
   if (isImageView) {
@@ -655,12 +677,13 @@ function renderSource(file) {
 
   return `<section class="note-workspace source-workspace">
     <div class="note-toolbar">
-      <div class="view-switch" aria-label="资料视图">
+      ${isImage || isPdf ? `<div class="view-switch" aria-label="资料视图">
         <button class="${isImageView ? 'active' : ''}" data-action="set-source-view" data-view="image">${icon('image')}<span>图片</span></button>
         <button class="${!isImageView ? 'active' : ''}" data-action="set-source-view" data-view="text">${icon('text_snippet')}<span>转写文本</span></button>
-      </div>
+      </div>` : ''}
       <div class="source-label">${icon('lock')}<span>只读资料</span><span class="source-format">${escape(source.format.toUpperCase())}</span></div>
       <div class="note-toolbar-right">
+        ${iconButton('drive_file_move', 'move-source', '移动到')}
         ${iconButton('download', 'download-source', '下载原件')}
         ${iconButton('refresh', 'retry-source', '重新解析')}
         ${iconButton('link', 'copy-link', '复制双链')}
@@ -801,7 +824,7 @@ function renderMenu() {
   const item = vault().items.find((entry) => entry.id === state.menu.id)
   if (!item) return ''
   if (isSource(item))
-    return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu"><button data-action="download-source" data-id="${item.id}">${icon('download')}下载原件</button><button data-action="retry-source" data-id="${item.id}">${icon('refresh')}重新解析</button><div class="menu-divider"></div><button class="danger" data-action="delete-item">${icon('delete')}删除</button></div>`
+    return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu"><button data-action="move-item">${icon('drive_file_move')}移动到</button><button data-action="download-source" data-id="${item.id}">${icon('download')}下载原件</button><button data-action="retry-source" data-id="${item.id}">${icon('refresh')}重新解析</button><div class="menu-divider"></div><button class="danger" data-action="delete-item">${icon('delete')}删除</button></div>`
   if (containsSource(vault(), item.id))
     return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu"><button data-action="new-child-note">${icon('note_add')}新建笔记</button><button data-action="new-child-folder">${icon('create_new_folder')}新建文件夹</button><p class="source-menu-hint">包含只读资料，不能移动或删除</p></div>`
   return `${close}<div class="popup-menu item-menu" style="left:${state.menu.x}px;top:${state.menu.y}px" role="menu">${item.type === 'folder' ? '<button data-action="new-child-note">' + icon('note_add') + '新建笔记</button><button data-action="new-child-folder">' + icon('create_new_folder') + '新建文件夹</button>' : ''}<button data-action="rename-item">${icon('drive_file_rename_outline')}重命名</button><button data-action="move-item">${icon('drive_file_move')}移动到</button>${item.type === 'file' ? '<button data-action="download-note">' + icon('download') + '下载 Markdown</button>' : ''}<div class="menu-divider"></div><button class="danger" data-action="delete-item">${icon('delete')}删除</button></div>`
@@ -946,7 +969,7 @@ async function handleAction(action, target) {
     render()
   } else if (action === 'note-menu') showItemMenu(state.selectedId, target)
   else if (action === 'new-note' || action === 'new-folder')
-    showModal(action, { parentId: selected()?.parentId || null })
+    showModal(action, { parentId: getCurrentFolderId() })
   else if (action === 'new-child-note' || action === 'new-child-folder')
     showModal(action === 'new-child-note' ? 'new-note' : 'new-folder', {
       parentId: menuItem.id,
@@ -976,7 +999,15 @@ async function handleAction(action, target) {
     }
   } else if (action === 'rename-item')
     showModal('rename', { id: menuItem.id, value: extractTitle(menuItem) })
-  else if (action === 'move-item') showModal('move', { id: menuItem.id })
+  else if (action === 'move-item' || action === 'move-source') {
+    const targetItem =
+      vault().items.find((item) => item.id === target.dataset.id) ||
+      menuItem ||
+      selected()
+    if (!targetItem) return
+    state.menu = null
+    showModal('move', { id: targetItem.id })
+  }
   else if (action === 'delete-item') {
     const targetItem =
       vault().items.find((item) => item.id === target.dataset.id) ||
@@ -1185,6 +1216,7 @@ app.addEventListener('click', async (event) => {
     } else if (target.dataset.select) selectFile(target.dataset.select)
     else if (target.dataset.folder) {
       const id = target.dataset.folder
+      state.activeFolderId = id
       state.collapsed.has(id)
         ? state.collapsed.delete(id)
         : state.collapsed.add(id)
@@ -1200,6 +1232,7 @@ app.addEventListener('click', async (event) => {
       if (state.aiBusy) return notify('请先停止当前对话')
       database.activeId = target.dataset.vault
       state.selectedId = database.selections?.[database.activeId]
+      state.activeFolderId = null
       state.menu = null
       state.page = 'note'
       state.search = ''
@@ -1745,41 +1778,129 @@ document.addEventListener('keydown', (event) => {
   }
 })
 
+let dragTargetRow = null
+
 app.addEventListener('dragstart', (event) => {
   const row = event.target.closest('[data-tree-id]')
   if (row) {
-    if (containsSource(vault(), row.dataset.treeId))
+    const item = vault().items.find((entry) => entry.id === row.dataset.treeId)
+    if (item?.type === 'folder' && containsSource(vault(), row.dataset.treeId))
       return event.preventDefault()
+    event.dataTransfer.setData('application/x-zhiku-tree-id', row.dataset.treeId)
     event.dataTransfer.setData('text/plain', row.dataset.treeId)
     event.dataTransfer.effectAllowed = 'move'
   }
 })
 app.addEventListener('dragover', (event) => {
+  const isFiles = event.dataTransfer.types.includes('Files')
+  if (isFiles) {
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+    const row = event.target.closest('[data-tree-id]')
+    const rowItem = row
+      ? vault().items.find((item) => item.id === row.dataset.treeId)
+      : null
+    const targetRow =
+      rowItem?.type === 'folder'
+        ? row
+        : rowItem?.type === 'file' && rowItem.parentId
+          ? document.querySelector(`[data-tree-id="${rowItem.parentId}"]`)
+          : null
+    if (dragTargetRow !== targetRow) {
+      if (dragTargetRow) dragTargetRow.classList.remove('drag-target')
+      dragTargetRow = targetRow
+      if (dragTargetRow) dragTargetRow.classList.add('drag-target')
+    }
+    return
+  }
   const row = event.target.closest('[data-tree-id]')
+  const rowItem = row
+    ? vault().items.find((item) => item.id === row.dataset.treeId)
+    : null
   if (
-    (row &&
-      vault().items.find((item) => item.id === row.dataset.treeId)?.type ===
-        'folder') ||
-    event.target.hasAttribute('data-drop-root')
+    rowItem?.type === 'folder' ||
+    event.target.hasAttribute('data-drop-root') ||
+    event.target.closest('[data-drop-root]')
   ) {
     event.preventDefault()
     event.dataTransfer.dropEffect = 'move'
+    const targetRow = rowItem?.type === 'folder' ? row : null
+    if (dragTargetRow !== targetRow) {
+      if (dragTargetRow) dragTargetRow.classList.remove('drag-target')
+      dragTargetRow = targetRow
+      if (dragTargetRow) dragTargetRow.classList.add('drag-target')
+    }
+  } else if (dragTargetRow) {
+    dragTargetRow.classList.remove('drag-target')
+    dragTargetRow = null
+  }
+})
+app.addEventListener('dragleave', (event) => {
+  if (!event.relatedTarget || !app.contains(event.relatedTarget)) {
+    if (dragTargetRow) {
+      dragTargetRow.classList.remove('drag-target')
+      dragTargetRow = null
+    }
+  }
+})
+app.addEventListener('dragend', () => {
+  if (dragTargetRow) {
+    dragTargetRow.classList.remove('drag-target')
+    dragTargetRow = null
   }
 })
 app.addEventListener('drop', async (event) => {
-  const row = event.target.closest('[data-tree-id]')
-  const parentId = row?.dataset.treeId || null
-  if (
-    row &&
-    vault().items.find((item) => item.id === parentId)?.type !== 'folder'
-  )
-    return
-  if (!event.target.closest('.file-tree')) return
   event.preventDefault()
+  if (dragTargetRow) {
+    dragTargetRow.classList.remove('drag-target')
+    dragTargetRow = null
+  }
+  const isFiles =
+    event.dataTransfer.types.includes('Files') &&
+    event.dataTransfer.files &&
+    event.dataTransfer.files.length > 0
+
+  if (isFiles) {
+    const chosen = [...event.dataTransfer.files]
+    if (!chosen.length) return
+    const row = event.target.closest('[data-tree-id]')
+    const rowItem = row
+      ? vault().items.find((item) => item.id === row.dataset.treeId)
+      : null
+    let targetFolderId = null
+    if (rowItem?.type === 'folder') {
+      targetFolderId = rowItem.id
+    } else if (rowItem?.type === 'file') {
+      targetFolderId = rowItem.parentId || null
+    } else {
+      targetFolderId = getCurrentFolderId()
+    }
+    await uploadDroppedFiles(chosen, targetFolderId)
+    return
+  }
+
+  const treeId =
+    event.dataTransfer.getData('application/x-zhiku-tree-id') ||
+    event.dataTransfer.getData('text/plain')
+  if (!treeId) return
+
+  const row = event.target.closest('[data-tree-id]')
+  let parentId = null
+  if (row) {
+    const targetItem = vault().items.find((item) => item.id === row.dataset.treeId)
+    if (targetItem?.type === 'folder') {
+      parentId = targetItem.id
+    } else if (targetItem?.type === 'file') {
+      parentId = targetItem.parentId || null
+    } else {
+      return
+    }
+  } else if (!event.target.closest('[data-drop-root]')) {
+    return
+  }
+
   try {
-    await updateLocation(vault(), event.dataTransfer.getData('text/plain'), {
-      parentId,
-    })
+    await updateLocation(vault(), treeId, { parentId })
     if (parentId) state.collapsed.delete(parentId)
     save()
     render()
@@ -1788,52 +1909,91 @@ app.addEventListener('drop', async (event) => {
   }
 })
 
+window.addEventListener('dragover', (event) => {
+  if (event.dataTransfer.types.includes('Files')) {
+    event.preventDefault()
+  }
+})
+window.addEventListener('drop', (event) => {
+  if (event.dataTransfer.types.includes('Files')) {
+    event.preventDefault()
+  }
+})
+
+async function uploadDroppedFiles(files, parentId = null) {
+  if (!files.length || state.importingSources) return
+  const targetVault = vault()
+  const failures = []
+  let count = 0
+  let firstId = null
+  state.importingSources = true
+  notify('正在导入文件，原件仅保存在本机')
+  try {
+    for (const file of files) {
+      if (!database.vaults.includes(targetVault)) break
+      try {
+        if (NOTE_PATTERN.test(file.name)) {
+          const content = await file.text()
+          const item = await createWorkspaceItem(
+            targetVault,
+            'file',
+            file.name,
+            parentId,
+            content,
+          )
+          firstId ||= item.id
+          count++
+        } else if (isDocumentName(file.name)) {
+          const item = await importSourceFile(targetVault, file, parentId)
+          firstId ||= item.id
+          count++
+        } else {
+          failures.push(`${file.name} 不支持此文件格式`)
+        }
+      } catch (error) {
+        failures.push(`${file.name} ${error.message}`)
+      }
+    }
+    if (parentId) state.collapsed.delete(parentId)
+    state.activeFolderId = parentId
+    if (vault().id === targetVault.id && firstId) {
+      state.selectedId = firstId
+      state.mode = 'read'
+      state.page = 'note'
+      state.sidebarOpen = false
+      const fmt = targetVault.items.find((item) => item.id === firstId)?.source?.format
+      if (fmt && (isImageSource(fmt) || fmt === 'pdf')) {
+        state.sourceView = 'image'
+      } else {
+        state.sourceView = 'text'
+      }
+      database.selections ||= {}
+      database.selections[targetVault.id] = firstId
+    }
+    await saveDatabase(database)
+    render()
+    notify(
+      failures.length
+        ? `已导入 ${count} 份，${failures[0]}`
+        : `已添加 ${count} 份资料`,
+    )
+  } catch (error) {
+    notify(error.message)
+  } finally {
+    state.importingSources = false
+  }
+}
+
 document.querySelector('#attachment-input').accept += ',' + DOCUMENT_ACCEPT
-document.querySelector('#source-input').accept = DOCUMENT_ACCEPT
+document.querySelector('#source-input').accept = DOCUMENT_ACCEPT + ',.md,.markdown,.txt'
 document
   .querySelector('#source-input')
   .addEventListener('change', async (event) => {
     const chosen = [...event.target.files]
     event.target.value = ''
     if (!chosen.length || state.importingSources) return
-    const targetVault = vault()
-    const parentId = selected()?.parentId || null
-    const failures = []
-    let count = 0,
-      firstId
-    state.importingSources = true
-    notify('正在导入资料，原件仅保存在本机')
-    try {
-      for (const file of chosen) {
-        if (!database.vaults.includes(targetVault)) break
-        try {
-          const item = await importSourceFile(targetVault, file, parentId)
-          firstId ||= item.id
-          count++
-        } catch (error) {
-          failures.push(`${file.name}：${error.message}`)
-        }
-      }
-      if (vault().id === targetVault.id && firstId) {
-        state.selectedId = firstId
-        state.mode = 'read'
-        state.page = 'note'
-        state.sidebarOpen = false
-        database.selections ||= {}
-        database.selections[targetVault.id] = firstId
-      }
-      await saveDatabase(database)
-      render()
-      notify(
-        failures.length
-          ? `已导入 ${count} 份，${failures[0]}`
-          : `已添加 ${count} 份只读资料`,
-      )
-    } catch (error) {
-      notify(error.message)
-    } finally {
-      state.importingSources = false
-    }
+    const parentId = getCurrentFolderId()
+    await uploadDroppedFiles(chosen, parentId)
   })
 
 document
@@ -1875,7 +2035,7 @@ document
   })
 
 async function updateLocation(targetVault, id, change) {
-  assertMutableItem(targetVault, id)
+  if (Object.hasOwn(change, 'name')) assertMutableItem(targetVault, id)
   await flushLocalWrites(targetVault)
   const commit = () => {
     const references = targetVault.items
@@ -1947,7 +2107,7 @@ async function executeTool(targetVault, name, args) {
     await saveDatabase(database)
     return result
   }
-  if (['update_file', 'rename_item', 'move_item', 'delete_item'].includes(name))
+  if (['update_file', 'rename_item', 'delete_item'].includes(name))
     assertMutableItem(targetVault, args.id)
   let result
   if (name === 'create_file') {

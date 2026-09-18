@@ -497,3 +497,26 @@ test('未被索引的新资料也不能被父目录操作删除或移动', async
   )
   assert.ok(await root.getDirectoryHandle('分类'))
 })
+
+test('资料文件跨目录移动保留二进制原件', async () => {
+  const { root, vault } = await setup()
+  const bytes = new Uint8Array([1, 2, 3, 4, 5])
+  const source = {
+    id: makeId(),
+    type: 'file',
+    kind: 'source',
+    name: '手册.pdf',
+    parentId: null,
+    source: { blob: new Blob([bytes]) },
+  }
+  await createLocalEntry(root, vault, source)
+  vault.items.push(source)
+  await moveLocalEntry(root, vault, source, '分类/手册.pdf')
+  assert.ok(!root.children.has('手册.pdf'))
+  const targetDir = await root.getDirectoryHandle('分类')
+  const movedFile = await (await targetDir.getFileHandle('手册.pdf')).getFile()
+  assert.deepEqual(
+    new Uint8Array(await movedFile.arrayBuffer()),
+    bytes,
+  )
+})

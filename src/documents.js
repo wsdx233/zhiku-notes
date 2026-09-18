@@ -105,7 +105,7 @@ export function containsSource(vault, id) {
 export function assertMutableItem(vault, id) {
   const item = vault.items.find((entry) => entry.id === id)
   if (isSource(item))
-    throw new Error('资料为只读，不能修改资料内容或移动、重命名')
+    throw new Error('资料为只读，不能修改资料内容或重命名')
   if (containsSource(vault, id))
     throw new Error('包含只读资料，不能移动或重命名其所在文件夹')
 }

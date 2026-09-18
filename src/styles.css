@@ -332,11 +332,18 @@ input[type='checkbox'] {
 .tree-row.selected {
   background: #eee7f7;
 }
-.tree-row.selected .tree-open {
+.tree-row.drag-target {
+  background: #eee7f7;
+  outline: 2px dashed #9370be;
+  outline-offset: -2px;
+}
+.tree-row.selected .tree-open,
+.tree-row.drag-target .tree-open {
   color: #7955aa;
   font-weight: 500;
 }
-.tree-row.selected .file-icon {
+.tree-row.selected .file-icon,
+.tree-row.drag-target .file-icon {
   color: #9370be;
 }
 .tree-more {
@@ -2589,6 +2596,12 @@ details.callout .callout-title {
 [data-theme='dark'] .tree-row.selected {
   background: #2c253c;
   color: var(--primary);
+}
+[data-theme='dark'] .tree-row.drag-target {
+  background: #2c253c;
+  color: var(--primary);
+  outline: 2px dashed var(--primary);
+  outline-offset: -2px;
 }
 [data-theme='dark'] .tree-row:hover {
   background: #24212e;
